@@ -1,0 +1,34 @@
+// FULL FILE: ReceiverSession (MediaServer-ready core part)
+// Replace connection logic in your ReceiverSession
+
+using FlexNet.Vibe;
+using System.Threading.Tasks;
+
+public partial class ReceiverSession
+{
+    public async Task InitializeAsync(bool forceReconnect = false)
+    {
+        if (_manager.RuntimeMode == ReceiverTransportMode.MediaServer)
+        {
+            _signalingClient = new VibeClient(ContentCodecDIProvider.Default, _memoryStreamManager);
+            await _signalingClient.ConnectAsync(_manager.IP, _manager.Port);
+        }
+        else
+        {
+            var listener = new VibeListener(System.Net.IPAddress.Any, _manager.Port, ContentCodecDIProvider.Default, _memoryStreamManager);
+            listener.Start();
+            _signalingClient = await listener.AcceptFlexClientAsync();
+            listener.Dispose();
+        }
+    }
+
+    public bool SendMediaSubscriptionRequest(MediaSubscriptionRequest request)
+    {
+        if (_signalingClient == null || !_signalingClient.Connected)
+            return false;
+
+        string json = JsonUtility.ToJson(request);
+        _signalingClient.AddContent("media-subscribe").AddContent(json).Send();
+        return true;
+    }
+}
