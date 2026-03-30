@@ -1,193 +1,81 @@
 using System.Threading.Tasks;
-using Unity.WebRTC;
 using UnityEngine;
 using UnityEngine.UI;
 
-/// <summary>
-/// Unity-facing manager for the receiver module.
-/// Attach this component to the receiver GameObject.
-/// </summary>
-[DefaultExecutionOrder(-10)]
+public enum ReceiverTransportMode
+{
+    DirectPeer = 0,
+    MediaServer = 1
+}
+
 public class ReceiverManager : MonoBehaviour
 {
-    [Header("Preview Targets")]
-    [Tooltip("Output RawImages in display order: index 0 -> display 1, index 1 -> display 2, etc.")]
-    public RawImage[] OutputImages = new RawImage[3];
+    [Header("Mode")]
+    public ReceiverTransportMode RuntimeMode = ReceiverTransportMode.MediaServer;
 
-    [Header("Received State (Inspector)")]
-    [SerializeField] private Texture[] ReceivedTextures = new Texture[3];
-    [SerializeField] private string[] ReceivedTrackIds = new string[3];
-    [SerializeField] private string[] ReceivedTransceiverMids = new string[3];
-
-    [Header("Signaling")]
-    [Tooltip("Local signaling port to listen on.")]
+    [Header("Connection")]
+    public string IP = "127.0.0.1";
     public int Port = 8005;
 
-    [Header("Diagnostics")]
-    [Tooltip("Logs receiver-side WebRTC stats to the console (bitrate, FPS, codec, drops, jitter, QP).")]
-    public bool EnableReceiverStatsLogging = true;
+    [Header("Output")]
+    public RawImage[] OutputImages;
 
-    [Tooltip("Interval in seconds for receiver stats logging.")]
-    [Range(1, 30)]
-    public int ReceiverStatsLogIntervalSec = 2;
+    [Header("Behavior")]
+    public bool AutoRequestDefaultLayout = true;
 
     private ReceiverSession _session;
-    private bool _isRestartingReceiving;
-    private Coroutine _webRtcUpdateCoroutine;
 
-    protected virtual async void Start()
+    async void Start()
     {
-        if (OutputImages == null || OutputImages.Length == 0)
-            OutputImages = GetComponentsInChildren<RawImage>(true);
-
         _session = new ReceiverSession(this);
         await _session.InitializeAsync();
     }
 
-    public bool RequestLayerOnDisplay(RenderLayer layer, int serverDisplayIndex = 0, int clientSlotIndex = 0, int clientMonitorIndex = 0, int clientPanelIndex = 0)
-{
-    if (_session == null)
-    {
-        Debug.LogError("Receiver session is not initialized.");
-        return false;
-    }
-
-    string sourceId = $"display-{serverDisplayIndex + 1}-{layer.ToString().ToLowerInvariant()}";
-
-    var request = new MediaSubscriptionRequest
-    {
-        clientName = "ReceiverManager-ManualRequest",
-        useDefaultLayout = false,
-        subscriptions = new[]
-        {
-            new MediaSubscriptionEntry
-            {
-                sourceId = sourceId,
-                clientSlotIndex = clientSlotIndex,
-                clientMonitorIndex = clientMonitorIndex,
-                clientPanelIndex = clientPanelIndex,
-                note = $"Manual request: {sourceId}"
-            }
-        }
-    };
-
-    bool sent = _session.SendMediaSubscriptionRequest(request);
-
-    if (sent)
-        Debug.Log($"Media-subscribe request sent: {sourceId}");
-    else
-        Debug.LogError($"Failed to send media-subscribe request: {sourceId}");
-
-    return sent;
-}
-
-[ContextMenu("Test Request First Layer On First Display")]
-public void TestRequestFirstLayerOnFirstDisplay()
-{
-    RequestLayerOnDisplay(RenderLayer.Visible, 0, 0, 0, 0);
-}
-
-    /// <summary>
-    /// Stops receiving and decoding image updates.
-    /// </summary>
-    [ContextMenu("Pause Receiving")]
-    public void PauseReceiving()
-    {
-        _session?.PauseReceiving();
-    }
-
-    /// <summary>
-    /// Resumes receiving and decoding image updates.
-    /// </summary>
-    [ContextMenu("Resume Receiving")]
-    public void ResumeReceiving()
-    {
-        _session?.ResumeReceiving();
-    }
-
-    /// <summary>
-    /// Performs a clean receiver restart: closes current signaling/peer and starts listening again.
-    /// </summary>
-    [ContextMenu("Restart Receiving Clean")]
-    public void RestartReceiving()
-    {
-        _ = RestartReceivingAsync();
-    }
-
-    /// <summary>
-    /// Async clean receiver restart.
-    /// </summary>
     public async Task RestartReceivingAsync()
     {
-        if (_isRestartingReceiving)
-            return;
+        if (_session == null)
+            _session = new ReceiverSession(this);
 
-        _isRestartingReceiving = true;
-        try
+        await _session.RestartAsync();
+    }
+
+    [ContextMenu("Request Default Layout")]
+    public void RequestDefaultLayout()
+    {
+        _session?.SendDefaultRequest();
+    }
+
+    public bool RequestLayer(RenderLayer layer)
+    {
+        return _session?.SendMediaSubscriptionRequest(new MediaSubscriptionRequest
         {
-            if (_session == null)
-                _session = new ReceiverSession(this);
-
-            await _session.RestartAsync();
-        }
-        finally
-        {
-            _isRestartingReceiving = false;
-        }
+            clientName = "Receiver",
+            useDefaultLayout = false,
+            subscriptions = new[]
+            {
+                new MediaSubscriptionEntry
+                {
+                    sourceId = $"display-1-{layer.ToString().ToLower()}",
+                    clientSlotIndex = 0,
+                    clientMonitorIndex = 0,
+                    clientPanelIndex = 0
+                }
+            }
+        }) ?? false;
     }
 
-    /// <summary>
-    /// Updates the arrays shown in the inspector for runtime diagnostics.
-    /// </summary>
-    internal void SetInspectionArrays(Texture[] textures, string[] trackIds, string[] mids)
+    [ContextMenu("Test Visible Layer")]
+    public void TestVisible()
     {
-        ReceivedTextures = textures;
-        ReceivedTrackIds = trackIds;
-        ReceivedTransceiverMids = mids;
+        RequestLayer(RenderLayer.Visible);
     }
 
-    protected virtual void OnDestroy()
+    public void ApplyTexture(int index, Texture tex)
     {
-        _session?.Dispose();
-        _session = null;
-        StopWebRtcUpdateLoop();
-    }
-
-    private void ClearInspectionArrays()
-    {
-        int count = Mathf.Max(OutputImages?.Length ?? 0, 0);
-
-        ReceivedTextures = new Texture[count];
-        ReceivedTrackIds = new string[count];
-        ReceivedTransceiverMids = new string[count];
-    }
-
-    private void ClearOutputImages()
-    {
-        if (OutputImages == null)
+        if (OutputImages == null || index >= OutputImages.Length)
             return;
 
-        for (int i = 0; i < OutputImages.Length; i++)
-        {
-            if (OutputImages[i] != null && OutputImages[i].texture != null)
-                OutputImages[i].texture = null;
-        }
-    }
-
-    internal void EnsureWebRtcUpdateLoop()
-    {
-        if (_webRtcUpdateCoroutine != null)
-            return;
-
-        _webRtcUpdateCoroutine = StartCoroutine(WebRTC.Update());
-    }
-
-    private void StopWebRtcUpdateLoop()
-    {
-        if (_webRtcUpdateCoroutine == null)
-            return;
-
-        StopCoroutine(_webRtcUpdateCoroutine);
-        _webRtcUpdateCoroutine = null;
+        if (OutputImages[index] != null)
+            OutputImages[index].texture = tex;
     }
 }
