@@ -44,6 +44,49 @@ public class ReceiverManager : MonoBehaviour
         await _session.InitializeAsync();
     }
 
+    public bool RequestLayerOnDisplay(RenderLayer layer, int serverDisplayIndex = 0, int clientSlotIndex = 0, int clientMonitorIndex = 0, int clientPanelIndex = 0)
+{
+    if (_session == null)
+    {
+        Debug.LogError("Receiver session is not initialized.");
+        return false;
+    }
+
+    string sourceId = $"display-{serverDisplayIndex + 1}-{layer.ToString().ToLowerInvariant()}";
+
+    var request = new MediaSubscriptionRequest
+    {
+        clientName = "ReceiverManager-ManualRequest",
+        useDefaultLayout = false,
+        subscriptions = new[]
+        {
+            new MediaSubscriptionEntry
+            {
+                sourceId = sourceId,
+                clientSlotIndex = clientSlotIndex,
+                clientMonitorIndex = clientMonitorIndex,
+                clientPanelIndex = clientPanelIndex,
+                note = $"Manual request: {sourceId}"
+            }
+        }
+    };
+
+    bool sent = _session.SendMediaSubscriptionRequest(request);
+
+    if (sent)
+        Debug.Log($"Media-subscribe request sent: {sourceId}");
+    else
+        Debug.LogError($"Failed to send media-subscribe request: {sourceId}");
+
+    return sent;
+}
+
+[ContextMenu("Test Request First Layer On First Display")]
+public void TestRequestFirstLayerOnFirstDisplay()
+{
+    RequestLayerOnDisplay(RenderLayer.Visible, 0, 0, 0, 0);
+}
+
     /// <summary>
     /// Stops receiving and decoding image updates.
     /// </summary>
