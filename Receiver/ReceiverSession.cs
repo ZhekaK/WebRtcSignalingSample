@@ -958,6 +958,37 @@ public sealed class ReceiverSession : IDisposable
         _sendLoopTask = null;
     }
 
+    public bool SendMediaSubscriptionRequest(MediaSubscriptionRequest request)
+{
+    if (_isDisposed)
+    {
+        Debug.LogError("ReceiverSession is disposed. Cannot send media subscription request.");
+        return false;
+    }
+
+    if (_signalingClient == null)
+    {
+        Debug.LogError("Signaling client is not connected. Cannot send media subscription request.");
+        return false;
+    }
+
+    if (request == null)
+    {
+        Debug.LogError("Media subscription request is null.");
+        return false;
+    }
+
+    string json = JsonUtility.ToJson(request);
+    if (string.IsNullOrWhiteSpace(json))
+    {
+        Debug.LogError("Failed to serialize media subscription request.");
+        return false;
+    }
+
+    EnqueueSignalingMessage(MediaServerMessageTypes.Subscribe, json);
+    return true;
+}
+
     public void Dispose()
     {
         if (_isDisposed)
