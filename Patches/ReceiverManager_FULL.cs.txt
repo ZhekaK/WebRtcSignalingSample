@@ -1,0 +1,62 @@
+// FULL FILE: ReceiverManager (MediaServer-ready)
+// Replace your ReceiverManager.cs with this
+
+using System.Threading.Tasks;
+using UnityEngine;
+using UnityEngine.UI;
+
+public enum ReceiverTransportMode
+{
+    DirectPeer = 0,
+    MediaServer = 1
+}
+
+public class ReceiverManager : MonoBehaviour
+{
+    public ReceiverTransportMode RuntimeMode = ReceiverTransportMode.MediaServer;
+
+    public RawImage[] OutputImages;
+
+    public string IP = "127.0.0.1";
+    public int Port = 8005;
+
+    public bool AutoRequestDefaultLayout = true;
+
+    private ReceiverSession _session;
+
+    async void Start()
+    {
+        _session = new ReceiverSession(this);
+        await _session.InitializeAsync();
+    }
+
+    public bool RequestLayerOnDisplay(RenderLayer layer)
+    {
+        return _session?.SendMediaSubscriptionRequest(new MediaSubscriptionRequest
+        {
+            clientName = "test",
+            useDefaultLayout = false,
+            subscriptions = new[]
+            {
+                new MediaSubscriptionEntry
+                {
+                    sourceId = $"display-1-{layer.ToString().ToLower()}",
+                    clientSlotIndex = 0,
+                    clientMonitorIndex = 0,
+                    clientPanelIndex = 0
+                }
+            }
+        }) ?? false;
+    }
+
+    [ContextMenu("Test Request")]
+    public void Test()
+    {
+        RequestLayerOnDisplay(RenderLayer.Visible);
+    }
+
+    public async Task RestartReceivingAsync()
+    {
+        await _session.RestartAsync();
+    }
+}
