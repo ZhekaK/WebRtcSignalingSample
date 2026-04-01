@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using TabletTypes;
-using Unity.WebRTC;
 using UnityEngine;
 
 public enum SenderVideoCodecPreference
@@ -26,7 +25,7 @@ public enum SenderTransportMode
 /// Attach this component to the sender GameObject.
 /// </summary>
 [DefaultExecutionOrder(-20)]
-public class SenderManager : MonoBehaviour
+public partial class SenderManager : MonoBehaviour
 {
     public static SenderManager Instance { get; private set; }
 
@@ -81,6 +80,9 @@ public class SenderManager : MonoBehaviour
     [Range(1, 30)]
     public int SenderStatsLogIntervalSec = 10;
 
+    [Header("Inspector")]
+    [SerializeField] private string[] ActiveMediaServerSources = Array.Empty<string>();
+
     private SenderSession _session;
     private WebRtcMediaServer _mediaServer;
     private bool _isRestartingTransmission;
@@ -89,11 +91,12 @@ public class SenderManager : MonoBehaviour
 
     public static void InitializeManager()
     {
-        if (Instance) return;
+        if (Instance)
+            return;
 
-        GameObject reciever = new(nameof(SenderManager));
-        Instance = reciever.AddComponent<SenderManager>();
-        DontDestroyOnLoad(reciever);
+        GameObject sender = new(nameof(SenderManager));
+        Instance = sender.AddComponent<SenderManager>();
+        DontDestroyOnLoad(sender);
 
         Instance.LoadSettings(SaveManager.Instance.Settings.WebRtcSender);
         Instance.Subscribe();
@@ -106,6 +109,7 @@ public class SenderManager : MonoBehaviour
             Debug.LogError("WebRTC Settings not found");
             return;
         }
+
         IP = settings.IP;
         Port = settings.Port;
         TotalMaxBitrateMbps = settings.TotalMaxBitrateMbps;
@@ -114,13 +118,17 @@ public class SenderManager : MonoBehaviour
 
     private void Subscribe()
     {
-        if (LayerDataReceiverModeController.Instance == null) return;
+        if (LayerDataReceiverModeController.Instance == null)
+            return;
+
         LayerDataReceiverModeController.Instance.OnEvsStateChanged += LayerDataReceiverModeController_OnStateChanged;
     }
 
     private void Unsubscribe()
     {
-        if (LayerDataReceiverModeController.Instance == null) return;
+        if (LayerDataReceiverModeController.Instance == null)
+            return;
+
         LayerDataReceiverModeController.Instance.OnEvsStateChanged -= LayerDataReceiverModeController_OnStateChanged;
     }
 
@@ -129,6 +137,7 @@ public class SenderManager : MonoBehaviour
         if (RuntimeMode == SenderTransportMode.MediaServer)
         {
             _mediaServer = new WebRtcMediaServer(this);
+            SetMediaServerActivationSnapshot(Array.Empty<string>());
             _ = _mediaServer.StartAsync();
             return;
         }
@@ -142,226 +151,6 @@ public class SenderManager : MonoBehaviour
             _ = _session.InitializeAsync(forceReconnect: false);
     }
 
-
-    private void LayerDataReceiverModeController_OnStateChanged(object sender, EvsStateChangedEventArgs e)
-    {
-        if (e.CurrentStateEvs)
-            SetRenderTextures(RenderLayer.EVS);
-        else
-            SetRenderTextures(CastToNewEnum(e.CurrentLayer));
-    }
-
-    private RenderLayer CastToNewEnum(ImitatorVisibleLayer layer)
-    {
-        switch (layer)
-        {
-            case ImitatorVisibleLayer.Visible:
-                return RenderLayer.Visible;
-            case ImitatorVisibleLayer.LWIR:
-                return RenderLayer.LWIR;
-            case ImitatorVisibleLayer.SWIR:
-                return RenderLayer.SWIR;
-            case ImitatorVisibleLayer.Labels:
-                return RenderLayer.Labels;
-            default:
-                return RenderLayer.Visible;
-        }
-    }
-    public void SetRenderTextures(RenderLayer layer)
-    {
-        if (SourceRenderTextures == null)
-            SourceRenderTextures = new List<RenderTexture>();
-        else
-            SourceRenderTextures.Clear();
-
-        foreach (DisplayData displayData in DisplaysManager.Instance.DisplaysDatas.Values)
-        {
-            if (displayData.RenderingLayersDatas.TryGetValue(layer, out RenderLayerData renderLayerData))
-                if (renderLayerData.Settings.ExistOnDisplay) SourceRenderTextures.Add(renderLayerData.RT);
-        }
-
-        _session?.SyncTracksWithSources();
-    }
-
-    /// <summary>
-    /// Stops sending video tracks without destroying the session.
-    /// </summary>
-    [ContextMenu("Pause Transmission")]
-    public void PauseTransmission()
-    {
-        _session?.PauseTransmission();
-    }
-
-    /// <summary>
-    /// Resumes sending previously paused video tracks.
-    /// </summary>
-    [ContextMenu("Resume Transmission")]
-    public void ResumeTransmission()
-    {
-        _session?.ResumeTransmission();
-    }
-
-    /// <summary>
-    /// Applies current encoder settings to all active sender tracks immediately.
-    /// </summary>
-    [ContextMenu("Apply Encoder Settings Now")]
-    public bool ApplyEncoderSettingsNow()
-    {
-        return _session != null && _session.ApplyEncoderSettingsNow();
-    }
-
-    /// <summary>
-    /// Resizes a source RenderTexture and refreshes the track in real time.
-    /// </summary>
-    public bool ChangeSourceResolution(int displayIndex, int width, int height)
-    {
-        return _session != null && _session.ChangeSourceResolution(displayIndex, width, height);
-    }
-
-    /// <summary>
-    /// Rebuilds a sender track from the current RenderTexture at display index.
-    /// </summary>
-    public bool RefreshSourceTrack(int displayIndex)
-    {
-        return _session != null && _session.RefreshSourceTrack(displayIndex);
-    }
-
-    /// <summary>
-    /// Synchronizes active WebRTC tracks with the current SourceRenderTextures collection.
-    /// Non-null textures become active tracks; null slots are removed from transmission.
-    /// </summary>
-    [ContextMenu("Sync Tracks With Sources")]
-    public bool SyncTracksWithSources()
-    {
-        return _session != null && _session.SyncTracksWithSources();
-    }
-
-    [ContextMenu("Test Add Track")]
-    public void TestAddTrack()
-    {
-        if (SourceRenderTextures == null || SourceRenderTextures.Count == 0)
-        {
-            Debug.LogError("No source textures configured.");
-            return;
-        }
-
-        if (!AddSourceTrack(SourceRenderTextures[SourceRenderTextures.Count - 1])) Debug.LogError("Add track failed");
-        if (!SyncTracksWithSources()) Debug.LogError("Sync track failed");
-    }
-
-    [ContextMenu("Test Remove Track")]
-    public void TestRemoveTrack()
-    {
-        if (SourceRenderTextures == null || SourceRenderTextures.Count == 0)
-        {
-            Debug.LogError("No source textures configured.");
-            return;
-        }
-
-        if (!RemoveSourceTrack(SourceRenderTextures.Count - 1)) Debug.LogError("Remove track failed");
-        if (!SyncTracksWithSources()) Debug.LogError("Sync track failed");
-    }
-    /// <summary>
-    /// Adds or replaces a source texture at runtime and ensures a matching sender track exists.
-    /// </summary>
-    public bool AddSourceTrack(RenderTexture sourceTexture, int displayIndex = -1)
-    {
-        if (sourceTexture == null)
-        {
-            Debug.LogError("Cannot add null source texture.");
-            return false;
-        }
-
-        int targetIndex = ResolveTargetDisplayIndex(displayIndex);
-        EnsureSourceCapacity(targetIndex + 1);
-        SourceRenderTextures[targetIndex] = sourceTexture;
-
-        if (_session == null)
-            return true;
-
-        return _session.AddOrReplaceSourceTrack(targetIndex, sourceTexture);
-    }
-
-    /// <summary>
-    /// Removes a source track from transmission for the specified display index.
-    /// </summary>
-    public bool RemoveSourceTrack(int displayIndex, bool clearSourceSlot = true)
-    {
-        if (displayIndex < 0 || SourceRenderTextures == null || displayIndex >= SourceRenderTextures.Count)
-        {
-            Debug.LogError($"Invalid display index: {displayIndex}");
-            return false;
-        }
-
-        bool removed = _session == null || _session.RemoveSourceTrack(displayIndex);
-        if (!removed)
-            return false;
-
-        if (clearSourceSlot)
-            SourceRenderTextures[displayIndex] = null;
-
-        TrimTrailingEmptySourceSlots();
-        return true;
-    }
-
-    /// <summary>
-    /// Performs a clean sender restart: closes current signaling/peer and starts again.
-    /// </summary>
-    [ContextMenu("Restart Transmission Clean")]
-    public void RestartTransmission()
-    {
-        _ = RestartTransmissionAsync();
-    }
-
-    /// <summary>
-    /// Async clean sender restart.
-    /// </summary>
-    public async Task RestartTransmissionAsync()
-    {
-        if (_isRestartingTransmission)
-            return;
-
-        _isRestartingTransmission = true;
-        try
-        {
-            if (_session == null)
-                _session = new SenderSession(this);
-
-            await _session.RestartAsync();
-        }
-        finally
-        {
-            _isRestartingTransmission = false;
-        }
-    }
-
-    /// <summary>
-    /// Changes only destination IP and reconnects signaling/session.
-    /// </summary>
-    public void ChangeDestinationIp(string newIp)
-    {
-        _ = ChangeDestinationEndpointAsync(newIp, Port);
-    }
-
-    /// <summary>
-    /// Changes destination endpoint and reconnects signaling/session.
-    /// </summary>
-    public void ChangeDestinationEndpoint(string newIp, int newPort)
-    {
-        _ = ChangeDestinationEndpointAsync(newIp, newPort);
-    }
-
-    /// <summary>
-    /// Async variant of destination endpoint update and reconnect.
-    /// </summary>
-    public async Task ChangeDestinationEndpointAsync(string newIp, int newPort)
-    {
-        if (_session == null)
-            return;
-
-        await _session.ChangeDestinationEndpointAsync(newIp, newPort);
-    }
-
     protected virtual void OnDestroy()
     {
         Unsubscribe();
@@ -369,119 +158,14 @@ public class SenderManager : MonoBehaviour
         StopConnectionLoop();
         _mediaServer?.Dispose();
         _mediaServer = null;
+        SetMediaServerActivationSnapshot(Array.Empty<string>());
         _session?.Dispose();
         _session = null;
         StopWebRtcUpdateLoop();
     }
 
-    private int ResolveTargetDisplayIndex(int preferredIndex)
+    internal void SetMediaServerActivationSnapshot(string[] snapshot)
     {
-        if (preferredIndex >= 0)
-            return preferredIndex;
-
-        if (SourceRenderTextures == null || SourceRenderTextures.Count == 0)
-            return 0;
-
-        for (int i = 0; i < SourceRenderTextures.Count; i++)
-        {
-            if (SourceRenderTextures[i] == null)
-                return i;
-        }
-
-        return SourceRenderTextures.Count;
-    }
-
-    private void EnsureSourceCapacity(int requiredLength)
-    {
-        requiredLength = Mathf.Max(1, requiredLength);
-
-        if (SourceRenderTextures == null)
-        {
-            SourceRenderTextures = new List<RenderTexture>(requiredLength);
-        }
-
-        while (SourceRenderTextures.Count < requiredLength)
-            SourceRenderTextures.Add(null);
-    }
-
-    private void TrimTrailingEmptySourceSlots()
-    {
-        if (SourceRenderTextures == null || SourceRenderTextures.Count == 0)
-            return;
-
-        int lastNonNull = -1;
-        for (int i = SourceRenderTextures.Count - 1; i >= 0; i--)
-        {
-            if (SourceRenderTextures[i] != null)
-            {
-                lastNonNull = i;
-                break;
-            }
-        }
-
-        int newLength = Mathf.Max(1, lastNonNull + 1);
-        if (newLength == SourceRenderTextures.Count)
-            return;
-
-        SourceRenderTextures.RemoveRange(newLength, SourceRenderTextures.Count - newLength);
-    }
-
-    private void StartConnectionLoop()
-    {
-        StopConnectionLoop();
-        _connectionLoopCts = new CancellationTokenSource();
-        _ = EnsureConnectionLoopAsync(_connectionLoopCts.Token);
-    }
-
-    private void StopConnectionLoop()
-    {
-        if (_connectionLoopCts == null)
-            return;
-
-        _connectionLoopCts.Cancel();
-        _connectionLoopCts.Dispose();
-        _connectionLoopCts = null;
-    }
-
-    private async Task EnsureConnectionLoopAsync(CancellationToken token)
-    {
-        while (!token.IsCancellationRequested)
-        {
-            try
-            {
-                if (_session == null)
-                    _session = new SenderSession(this);
-
-                if (!_session.IsConnectionReady)
-                    await _session.InitializeAsync(forceReconnect: false);
-
-                await Task.Delay(Mathf.Max(100, ReconnectDelayMs), token);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (System.Exception ex)
-            {
-                Debug.LogException(ex);
-            }
-        }
-    }
-
-    internal void EnsureWebRtcUpdateLoop()
-    {
-        if (_webRtcUpdateCoroutine != null)
-            return;
-
-        _webRtcUpdateCoroutine = StartCoroutine(WebRTC.Update());
-    }
-
-    private void StopWebRtcUpdateLoop()
-    {
-        if (_webRtcUpdateCoroutine == null)
-            return;
-
-        StopCoroutine(_webRtcUpdateCoroutine);
-        _webRtcUpdateCoroutine = null;
+        ActiveMediaServerSources = snapshot ?? Array.Empty<string>();
     }
 }

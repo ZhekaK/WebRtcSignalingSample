@@ -1,220 +1,247 @@
-using FlexNet;
-using FlexNet.Interfaces;
-using FlexNet.Vibe;
-using Microsoft.IO;
 using System;
-using System.Collections;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using Unity.WebRTC;
 using UnityEngine;
 
-public class ReceiverSession : IDisposable
+public sealed class ReceiverSession : IDisposable
 {
     private readonly ReceiverManager _manager;
+    private readonly ReceiverTrackBindingService _trackBindingService;
+    private readonly SemaphoreSlim _reconnectLock = new(1, 1);
 
-    private static readonly RecyclableMemoryStreamManager _memoryStreamManager = new();
+    private CancellationTokenSource _sessionCts = new();
+    private ReceiverSignalingClient _signalingClient;
+    private ReceiverPeerController _peerController;
+    private bool _isDisposed;
 
-    private IFlexClient _signalingClient;
-    private RTCPeerConnection _peer;
-
-    private CancellationTokenSource _cts = new();
-    private ConcurrentQueue<(string, string)> _outgoing = new();
-    private SemaphoreSlim _signal = new(0);
+    public bool IsConnectionReady => _peerController?.HasPeer == true && _signalingClient?.IsConnected == true;
 
     public ReceiverSession(ReceiverManager manager)
     {
         _manager = manager;
+        _trackBindingService = new ReceiverTrackBindingService(manager);
     }
 
     public async Task InitializeAsync(bool forceReconnect = false)
     {
-        if (forceReconnect)
-            Shutdown();
+        bool lockAcquired = false;
+        CancellationToken token = default;
 
-        if (_manager.RuntimeMode == ReceiverTransportMode.MediaServer)
+        try
         {
-            _signalingClient = new VibeClient(ContentCodecDIProvider.Default, _memoryStreamManager);
-            await _signalingClient.ConnectAsync(_manager.IP, _manager.Port);
-
-            Debug.Log($"[Receiver] Connected to MediaServer {_manager.IP}:{_manager.Port}");
+            await _reconnectLock.WaitAsync();
+            lockAcquired = true;
         }
-        else
+        catch (ObjectDisposedException)
         {
-            var listener = new VibeListener(
-                System.Net.IPAddress.Any,
-                _manager.Port,
-                ContentCodecDIProvider.Default,
-                _memoryStreamManager);
-
-            listener.Start();
-            _signalingClient = await listener.AcceptFlexClientAsync();
-            listener.Dispose();
+            return;
         }
 
-        var config = new RTCConfiguration
+        try
         {
-            iceServers = Array.Empty<RTCIceServer>()
-        };
+            if (_isDisposed)
+                return;
 
-        _peer = new RTCPeerConnection(ref config);
+            if (forceReconnect)
+                ShutdownConnection();
 
-        _peer.OnIceCandidate = OnIceCandidate;
-        _peer.OnTrack = OnTrack;
+            if (IsConnectionReady)
+                return;
 
-        _ = Task.Run(SendLoop);
-        _ = Task.Run(ReceiveLoop);
+            if (_peerController != null || _signalingClient != null)
+                ShutdownConnection();
 
-        if (_manager.AutoRequestDefaultLayout)
-            SendDefaultRequest();
+            ResetSessionCancellation();
+            token = _sessionCts.Token;
+            _trackBindingService.PrepareForConnection(Mathf.Max(_manager.OutputImages?.Length ?? 0, 0));
+
+            _signalingClient = new ReceiverSignalingClient();
+            SubscribeToSignaling(_signalingClient);
+            await _signalingClient.ConnectAsync(_manager.RuntimeMode, _manager.IP, _manager.Port, token);
+
+            if (_isDisposed || token.IsCancellationRequested)
+                return;
+
+            await Awaitable.MainThreadAsync();
+            if (_isDisposed || token.IsCancellationRequested)
+                return;
+
+            _peerController = new ReceiverPeerController(
+                _manager,
+                _trackBindingService.HandleTrack,
+                SendLocalCandidate,
+                SendLocalDescription);
+            _peerController.CreatePeer();
+
+            _manager.EnsureWebRtcUpdateLoop();
+            _signalingClient.StartLoops(token);
+            _manager.OnSessionConnected();
+        }
+        catch (Exception ex)
+        {
+            if (_isDisposed || token.IsCancellationRequested)
+                return;
+
+            ShutdownConnection();
+            Debug.LogWarning($"[Receiver] Connection attempt failed: {ex.Message}");
+        }
+        finally
+        {
+            if (lockAcquired)
+            {
+                try
+                {
+                    _reconnectLock.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (SemaphoreFullException)
+                {
+                }
+            }
+        }
     }
 
     public async Task RestartAsync()
     {
+        if (_isDisposed)
+            return;
+
         await InitializeAsync(true);
     }
 
-    public void SendDefaultRequest()
+    public void PauseReceiving()
     {
-        SendMediaSubscriptionRequest(new MediaSubscriptionRequest
-        {
-            clientName = "Receiver",
-            useDefaultLayout = true,
-            subscriptions = Array.Empty<MediaSubscriptionEntry>()
-        });
+        _trackBindingService.PauseReceiving();
+    }
+
+    public void ResumeReceiving()
+    {
+        _trackBindingService.ResumeReceiving();
     }
 
     public bool SendMediaSubscriptionRequest(MediaSubscriptionRequest request)
     {
-        if (_signalingClient == null || !_signalingClient.Connected)
-        {
-            Debug.LogError("[Receiver] Not connected to signaling server");
-            return false;
-        }
-
-        string json = JsonUtility.ToJson(request);
-        _outgoing.Enqueue(("media-subscribe", json));
-        _signal.Release();
-
-        return true;
-    }
-
-    private async Task SendLoop()
-    {
-        while (!_cts.IsCancellationRequested)
-        {
-            await _signal.WaitAsync();
-
-            while (_outgoing.TryDequeue(out var msg))
-            {
-                _signalingClient
-                    .AddContent(msg.Item1)
-                    .AddContent(msg.Item2)
-                    .Send();
-            }
-        }
-    }
-
-    private async Task ReceiveLoop()
-    {
-        while (!_cts.IsCancellationRequested)
-        {
-            using var res = await _signalingClient.ReceiveAsync();
-
-            res.GetContent(out string type).GetContent(out string json);
-
-            await Awaitable.MainThreadAsync();
-
-            switch (type)
-            {
-                case "candidate":
-                    var cand = JsonUtility.FromJson<RTCIceCandidateInit>(json);
-                    _peer.AddIceCandidate(new RTCIceCandidate(cand));
-                    break;
-
-                case "description":
-                    var desc = JsonUtility.FromJson<RTCSessionDescription>(json);
-                    _manager.StartCoroutine(SetRemote(desc));
-                    break;
-
-                case "media-hello":
-                    Debug.Log("[Receiver] hello");
-                    break;
-
-                case "media-catalog":
-                    Debug.Log("[Receiver] catalog received");
-                    break;
-
-                case "media-subscribe-ack":
-                    Debug.Log("[Receiver] subscribe ack");
-                    break;
-
-                default:
-                    Debug.Log($"[Receiver] unknown: {type}");
-                    break;
-            }
-        }
-    }
-
-    private IEnumerator SetRemote(RTCSessionDescription desc)
-    {
-        var op = _peer.SetRemoteDescription(ref desc);
-        yield return op;
-
-        var answerOp = _peer.CreateAnswer();
-        yield return answerOp;
-
-        var answer = answerOp.Desc;
-
-        var setLocal = _peer.SetLocalDescription(ref answer);
-        yield return setLocal;
-
-        Send("description", JsonUtility.ToJson(answer));
-    }
-
-    private void Send(string type, string payload)
-    {
-        _outgoing.Enqueue((type, payload));
-        _signal.Release();
-    }
-
-    private void OnIceCandidate(RTCIceCandidate c)
-    {
-        Send("candidate", JsonUtility.ToJson(new RTCIceCandidateInit
-        {
-            candidate = c.Candidate,
-            sdpMid = c.SdpMid,
-            sdpMLineIndex = c.SdpMLineIndex
-        }));
-    }
-
-    private void OnTrack(RTCTrackEvent e)
-    {
-        if (e.Track is VideoStreamTrack video)
-        {
-            video.OnVideoReceived += tex =>
-            {
-                _manager.ApplyTexture(0, tex);
-            };
-        }
-    }
-
-    private void Shutdown()
-    {
-        _cts.Cancel();
-
-        _peer?.Close();
-        _peer?.Dispose();
-        _peer = null;
-
-        _signalingClient?.Dispose();
-        _signalingClient = null;
+        return _signalingClient != null && _signalingClient.SendSubscriptionRequest(request);
     }
 
     public void Dispose()
     {
-        Shutdown();
+        if (_isDisposed)
+            return;
+
+        _isDisposed = true;
+        ShutdownConnection();
+        _sessionCts?.Dispose();
+        _reconnectLock.Dispose();
+    }
+
+    private void SubscribeToSignaling(ReceiverSignalingClient signalingClient)
+    {
+        if (signalingClient == null)
+            return;
+
+        signalingClient.CandidateReceived += OnRemoteCandidateReceived;
+        signalingClient.DescriptionReceived += OnRemoteDescriptionReceived;
+        signalingClient.TrackMapReceived += OnTrackMapReceived;
+        signalingClient.HelloReceived += OnHelloReceived;
+        signalingClient.CatalogReceived += OnCatalogReceived;
+        signalingClient.SubscribeAckReceived += OnSubscribeAckReceived;
+        signalingClient.ConnectionLost += OnSignalingConnectionLost;
+    }
+
+    private void UnsubscribeFromSignaling(ReceiverSignalingClient signalingClient)
+    {
+        if (signalingClient == null)
+            return;
+
+        signalingClient.CandidateReceived -= OnRemoteCandidateReceived;
+        signalingClient.DescriptionReceived -= OnRemoteDescriptionReceived;
+        signalingClient.TrackMapReceived -= OnTrackMapReceived;
+        signalingClient.HelloReceived -= OnHelloReceived;
+        signalingClient.CatalogReceived -= OnCatalogReceived;
+        signalingClient.SubscribeAckReceived -= OnSubscribeAckReceived;
+        signalingClient.ConnectionLost -= OnSignalingConnectionLost;
+    }
+
+    private void OnRemoteCandidateReceived(RTCIceCandidateInit candidate)
+    {
+        _peerController?.AddIceCandidate(candidate);
+    }
+
+    private void OnRemoteDescriptionReceived(RTCSessionDescription description)
+    {
+        _peerController?.EnqueueRemoteDescription(description);
+    }
+
+    private void OnTrackMapReceived(string json)
+    {
+        _trackBindingService.ApplyTrackMap(json);
+    }
+
+    private void OnHelloReceived(MediaServerHelloMessage hello)
+    {
+        Debug.Log($"[Receiver] MediaServer hello: {hello?.sessionId}");
+    }
+
+    private void OnCatalogReceived(MediaCatalogMessage catalog)
+    {
+        _manager.OnCatalogReceived(catalog);
+    }
+
+    private void OnSubscribeAckReceived(MediaSubscriptionAck ack)
+    {
+        Debug.Log($"[Receiver] SubscribeAck: {ack?.message}");
+    }
+
+    private void OnSignalingConnectionLost(Exception ex)
+    {
+        if (_isDisposed)
+            return;
+
+        if (ex != null)
+            Debug.LogWarning($"[Receiver] Signaling disconnected: {ex.Message}");
+
+        ShutdownConnection();
+    }
+
+    private void SendLocalCandidate(RTCIceCandidateInit candidate)
+    {
+        _signalingClient?.SendCandidate(candidate);
+    }
+
+    private void SendLocalDescription(RTCSessionDescription description)
+    {
+        _signalingClient?.SendDescription(description);
+    }
+
+    private void ResetSessionCancellation()
+    {
+        _sessionCts?.Dispose();
+        _sessionCts = new CancellationTokenSource();
+    }
+
+    private void ShutdownConnection()
+    {
+        try
+        {
+            _sessionCts?.Cancel();
+        }
+        catch
+        {
+        }
+
+        var signalingClient = _signalingClient;
+        _signalingClient = null;
+        UnsubscribeFromSignaling(signalingClient);
+        signalingClient?.Dispose();
+
+        var peerController = _peerController;
+        _peerController = null;
+        peerController?.Dispose();
+
+        _trackBindingService.Shutdown();
     }
 }

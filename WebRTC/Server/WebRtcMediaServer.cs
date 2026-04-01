@@ -16,6 +16,7 @@ internal sealed class WebRtcMediaServer : IDisposable
 
     private readonly SenderManager _manager;
     private readonly MediaServerSourceCatalog _catalog = new();
+    private readonly MediaServerActivationTable _activationTable = new();
     private readonly Dictionary<string, WebRtcMediaServerClientSession> _sessions = new();
     private readonly object _sessionsLock = new();
 
@@ -42,6 +43,7 @@ internal sealed class WebRtcMediaServer : IDisposable
             _listener.Start();
 
             Debug.Log($"[MediaServer] FlexNet signaling server started on port {_manager.Port}.");
+            PublishActivationSnapshot();
             _acceptLoopTask = Task.Run(() => AcceptLoopAsync(_serverCts.Token), _serverCts.Token);
             await Task.CompletedTask;
         }
@@ -50,6 +52,13 @@ internal sealed class WebRtcMediaServer : IDisposable
             Debug.LogException(ex);
             Dispose();
         }
+    }
+
+    public async Task RestartAsync()
+    {
+        ShutdownCore();
+        _isDisposed = false;
+        await StartAsync();
     }
 
     public MediaCatalogMessage BuildCatalogMessage()
@@ -70,33 +79,25 @@ internal sealed class WebRtcMediaServer : IDisposable
     public void LogRequestedActions(
         string sessionId,
         string clientName,
-        IReadOnlyList<MediaServerSourceCatalog.ResolvedSource> previous,
         IReadOnlyList<MediaServerSourceCatalog.ResolvedSource> next)
     {
         string sessionLabel = string.IsNullOrWhiteSpace(clientName)
             ? sessionId
             : $"{sessionId} ({clientName})";
 
-        var previousItems = previous ?? Array.Empty<MediaServerSourceCatalog.ResolvedSource>();
-        var nextItems = next ?? Array.Empty<MediaServerSourceCatalog.ResolvedSource>();
-        var previousKeys = new HashSet<string>(previousItems.Select(BuildActionKey), StringComparer.Ordinal);
-        var nextKeys = new HashSet<string>(nextItems.Select(BuildActionKey), StringComparer.Ordinal);
-
-        foreach (var added in nextItems.Where(item => !previousKeys.Contains(BuildActionKey(item))))
+        foreach (var transition in _activationTable.ApplySessionSelection(sessionId, next))
         {
+            string verb = transition.ChangeType == MediaServerActivationTable.ActivationChangeType.Activated
+                ? "ENABLE"
+                : "DISABLE";
+
             Debug.Log(
-                $"[MediaServer] Action ENABLE for {sessionLabel}: source={added.SourceName} " +
-                $"sourceId={added.SourceId} serverDisplay={added.ServerDisplayIndex + 1} " +
-                $"layer={added.RenderLayer} -> clientMonitor={added.ClientMonitorIndex + 1} panel={added.ClientPanelIndex} slot={added.ClientSlotIndex}");
+                $"[MediaServer] Action {verb} for {sessionLabel}: source={transition.SourceName} " +
+                $"sourceId={transition.SourceId} serverDisplay={transition.ServerDisplayIndex + 1} " +
+                $"layer={transition.RenderLayer} refs={transition.ReferenceCount}");
         }
 
-        foreach (var removed in previousItems.Where(item => !nextKeys.Contains(BuildActionKey(item))))
-        {
-            Debug.Log(
-                $"[MediaServer] Action DISABLE for {sessionLabel}: source={removed.SourceName} " +
-                $"sourceId={removed.SourceId} serverDisplay={removed.ServerDisplayIndex + 1} " +
-                $"layer={removed.RenderLayer} -> clientMonitor={removed.ClientMonitorIndex + 1} panel={removed.ClientPanelIndex} slot={removed.ClientSlotIndex}");
-        }
+        PublishActivationSnapshot();
     }
 
     public void NotifySessionClosed(WebRtcMediaServerClientSession session)
@@ -104,10 +105,79 @@ internal sealed class WebRtcMediaServer : IDisposable
         if (session == null)
             return;
 
+        foreach (var transition in _activationTable.RemoveSession(session.SessionId))
+        {
+            Debug.Log(
+                $"[MediaServer] Action DISABLE for {session.SessionId}: source={transition.SourceName} " +
+                $"sourceId={transition.SourceId} serverDisplay={transition.ServerDisplayIndex + 1} " +
+                $"layer={transition.RenderLayer} refs={transition.ReferenceCount}");
+        }
+
         lock (_sessionsLock)
         {
             _sessions.Remove(session.SessionId);
         }
+
+        PublishActivationSnapshot();
+    }
+
+    public bool PauseAllSessions()
+    {
+        int affected = 0;
+        foreach (var session in SnapshotSessions())
+        {
+            session.PauseTransmission();
+            affected++;
+        }
+
+        return affected > 0;
+    }
+
+    public bool ResumeAllSessions()
+    {
+        int affected = 0;
+        foreach (var session in SnapshotSessions())
+        {
+            session.ResumeTransmission();
+            affected++;
+        }
+
+        return affected > 0;
+    }
+
+    public bool ApplyEncoderSettingsNow()
+    {
+        bool applied = false;
+        foreach (var session in SnapshotSessions())
+            applied |= session.ApplyEncoderSettingsNow();
+
+        return applied;
+    }
+
+    public bool RefreshAllClientSubscriptions()
+    {
+        bool refreshed = false;
+        foreach (var session in SnapshotSessions())
+            refreshed |= session.ReapplyCurrentSubscription();
+
+        return refreshed;
+    }
+
+    public bool DebugAddTrackToFirstClient()
+    {
+        var session = SnapshotSessions().FirstOrDefault();
+        return session != null && session.DebugAddNextSource();
+    }
+
+    public bool DebugRemoveTrackFromFirstClient()
+    {
+        var session = SnapshotSessions().FirstOrDefault();
+        return session != null && session.DebugRemoveLastSource();
+    }
+
+    public string[] BuildActivationDebugSnapshot()
+    {
+        return _activationTable.BuildDebugSnapshot();
     }
 
     public void Dispose()
@@ -115,8 +185,12 @@ internal sealed class WebRtcMediaServer : IDisposable
         if (_isDisposed)
             return;
 
+        ShutdownCore();
         _isDisposed = true;
+    }
 
+    private void ShutdownCore()
+    {
         try
         {
             _serverCts?.Cancel();
@@ -128,18 +202,19 @@ internal sealed class WebRtcMediaServer : IDisposable
         _listener?.Dispose();
         _listener = null;
 
-        WebRtcMediaServerClientSession[] sessions;
-        lock (_sessionsLock)
+        WebRtcMediaServerClientSession[] sessions = SnapshotSessions();
+        foreach (var session in sessions)
         {
-            sessions = _sessions.Values.ToArray();
-            _sessions.Clear();
+            NotifySessionClosed(session);
+            session.Dispose();
         }
 
-        foreach (var session in sessions)
-            session.Dispose();
+        lock (_sessionsLock)
+            _sessions.Clear();
 
         _serverCts?.Dispose();
         _serverCts = null;
+        PublishActivationSnapshot();
     }
 
     private async Task AcceptLoopAsync(CancellationToken token)
@@ -163,9 +238,7 @@ internal sealed class WebRtcMediaServer : IDisposable
                 var session = new WebRtcMediaServerClientSession(this, _manager, signalingClient, sessionId);
 
                 lock (_sessionsLock)
-                {
                     _sessions[sessionId] = session;
-                }
 
                 Debug.Log($"[MediaServer] Client connected: {sessionId}");
                 _ = session.StartAsync();
@@ -185,8 +258,15 @@ internal sealed class WebRtcMediaServer : IDisposable
         }
     }
 
-    private static string BuildActionKey(MediaServerSourceCatalog.ResolvedSource source)
+    private void PublishActivationSnapshot()
     {
-        return $"{source.SourceId}|{source.ClientSlotIndex}|{source.ClientMonitorIndex}|{source.ClientPanelIndex}";
+        _manager.SetMediaServerActivationSnapshot(BuildActivationDebugSnapshot());
+    }
+
+    private WebRtcMediaServerClientSession[] SnapshotSessions()
+    {
+        lock (_sessionsLock)
+            return _sessions.Values.ToArray();
     }
 }
+

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -87,6 +87,7 @@ internal sealed class MediaServerSourceCatalog
         {
             clientName = string.Empty,
             useDefaultLayout = false,
+            allowEmptySelection = false,
             subscriptions = requestEntries.ToArray()
         };
     }
@@ -97,18 +98,18 @@ internal sealed class MediaServerSourceCatalog
         var entryById = snapshot.ToDictionary(entry => entry.Descriptor.sourceId, StringComparer.Ordinal);
         MediaSubscriptionRequest effectiveRequest = request;
 
-        if (effectiveRequest == null ||
-            effectiveRequest.useDefaultLayout ||
-            effectiveRequest.subscriptions == null ||
-            effectiveRequest.subscriptions.Length == 0)
-        {
+        if (effectiveRequest == null || effectiveRequest.useDefaultLayout)
             effectiveRequest = BuildDefaultRequest();
-        }
+        else if ((effectiveRequest.subscriptions == null || effectiveRequest.subscriptions.Length == 0) && !effectiveRequest.allowEmptySelection)
+            effectiveRequest = BuildDefaultRequest();
+
+        if (effectiveRequest?.allowEmptySelection == true && (effectiveRequest.subscriptions == null || effectiveRequest.subscriptions.Length == 0))
+            return Array.Empty<ResolvedSource>();
 
         var resolvedBySlot = new Dictionary<int, ResolvedSource>();
         int fallbackSlotIndex = 0;
 
-        foreach (var subscription in effectiveRequest.subscriptions)
+        foreach (var subscription in effectiveRequest?.subscriptions ?? Array.Empty<MediaSubscriptionEntry>())
         {
             if (subscription == null || string.IsNullOrWhiteSpace(subscription.sourceId))
                 continue;

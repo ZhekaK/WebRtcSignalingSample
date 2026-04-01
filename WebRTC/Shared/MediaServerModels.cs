@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 /// <summary>
 /// Initial greeting from the FlexNet media server to a newly connected WebRTC client.
@@ -57,6 +57,7 @@ public class MediaSubscriptionRequest
 {
     public string clientName = string.Empty;
     public bool useDefaultLayout = false;
+    public bool allowEmptySelection = false;
     public MediaSubscriptionEntry[] subscriptions = Array.Empty<MediaSubscriptionEntry>();
 }
 
