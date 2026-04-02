@@ -58,7 +58,7 @@ public sealed class ReceiverSession : IDisposable
 
             _signalingClient = new ReceiverSignalingClient();
             SubscribeToSignaling(_signalingClient);
-            await _signalingClient.ConnectAsync(_manager.RuntimeMode, _manager.IP, _manager.Port, token);
+            await _signalingClient.ConnectAsync(_manager.IP, _manager.Port, _manager.ClientName, token);
 
             if (_isDisposed || token.IsCancellationRequested)
                 return;
@@ -181,9 +181,9 @@ public sealed class ReceiverSession : IDisposable
         _trackBindingService.ApplyTrackMap(json);
     }
 
-    private void OnHelloReceived(MediaServerHelloMessage hello)
+    private void OnHelloReceived(SenderHelloMessage hello)
     {
-        Debug.Log($"[Receiver] MediaServer hello: {hello?.sessionId}");
+        Debug.Log($"[Receiver] Sender hello: {hello?.sessionId}");
     }
 
     private void OnCatalogReceived(MediaCatalogMessage catalog)
@@ -245,3 +245,5 @@ public sealed class ReceiverSession : IDisposable
         _trackBindingService.Shutdown();
     }
 }
+
+

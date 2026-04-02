@@ -1,11 +1,11 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using Unity.WebRTC;
 using UnityEngine;
 
-internal sealed class WebRtcMediaServerTrackService
+internal sealed class SenderSubscriberTrackService
 {
     private sealed class ServerSlot
     {
@@ -18,24 +18,27 @@ internal sealed class WebRtcMediaServerTrackService
         public string SourceName;
         public RenderTexture SourceTexture;
         public VideoStreamTrack Track;
+        public SenderSharedTrackRegistry.TrackLease TrackLease;
         public RTCRtpSender Sender;
         public RTCRtpTransceiver Transceiver;
     }
 
     private readonly SenderManager _manager;
+    private readonly SenderSharedTrackRegistry _sharedTrackRegistry;
     private readonly Dictionary<int, ServerSlot> _slots = new();
     private long _trackMapRevision;
 
     public bool HasTracks => _slots.Count > 0;
 
-    public WebRtcMediaServerTrackService(SenderManager manager)
+    public SenderSubscriberTrackService(SenderManager manager, SenderSharedTrackRegistry sharedTrackRegistry)
     {
         _manager = manager;
+        _sharedTrackRegistry = sharedTrackRegistry;
     }
 
     public bool SyncTracksWithSources(
         RTCPeerConnection peer,
-        IReadOnlyList<MediaServerSourceCatalog.ResolvedSource> sources,
+        IReadOnlyList<SenderSourceCatalog.ResolvedSource> sources,
         bool isTransmissionPaused,
         out bool anyChanged,
         out bool topologyChanged)
@@ -47,16 +50,16 @@ internal sealed class WebRtcMediaServerTrackService
             return false;
 
         var desiredSlotIndices = new HashSet<int>();
-        var resolvedSources = sources ?? Array.Empty<MediaServerSourceCatalog.ResolvedSource>();
+        var resolvedSources = sources ?? Array.Empty<SenderSourceCatalog.ResolvedSource>();
 
-        foreach (var source in resolvedSources)
+        foreach (SenderSourceCatalog.ResolvedSource source in resolvedSources)
         {
             if (source.ClientSlotIndex < 0 || source.SourceTexture == null)
                 continue;
 
             desiredSlotIndices.Add(source.ClientSlotIndex);
 
-            if (_slots.TryGetValue(source.ClientSlotIndex, out var slot))
+            if (_slots.TryGetValue(source.ClientSlotIndex, out ServerSlot slot))
             {
                 if (ReplaceSlotSource(peer, slot, source, isTransmissionPaused))
                     anyChanged = true;
@@ -71,7 +74,7 @@ internal sealed class WebRtcMediaServerTrackService
             }
         }
 
-        var staleSlotIndices = _slots.Keys.Where(slotIndex => !desiredSlotIndices.Contains(slotIndex)).ToArray();
+        int[] staleSlotIndices = _slots.Keys.Where(slotIndex => !desiredSlotIndices.Contains(slotIndex)).ToArray();
         foreach (int staleSlotIndex in staleSlotIndices)
         {
             if (RemoveSlot(peer, staleSlotIndex))
@@ -89,7 +92,7 @@ internal sealed class WebRtcMediaServerTrackService
         if (peer == null)
             return;
 
-        var allCodecs = RTCRtpSender.GetCapabilities(TrackKind.Video).codecs;
+        RTCRtpCodecCapability[] allCodecs = RTCRtpSender.GetCapabilities(TrackKind.Video).codecs;
         if (allCodecs == null || allCodecs.Length == 0)
             return;
 
@@ -109,12 +112,12 @@ internal sealed class WebRtcMediaServerTrackService
             }
         }
 
-        foreach (var transceiver in peer.GetTransceivers())
+        foreach (RTCRtpTransceiver transceiver in peer.GetTransceivers())
         {
             if (transceiver == null)
                 continue;
 
-            var error = transceiver.SetCodecPreferences(codecPreferences);
+            RTCErrorType error = transceiver.SetCodecPreferences(codecPreferences);
             if (error != RTCErrorType.None)
                 Debug.LogError($"SetCodecPreferences failed: {error}");
         }
@@ -122,18 +125,15 @@ internal sealed class WebRtcMediaServerTrackService
 
     public void ApplyTransmissionStateToAllSenders(bool isTransmissionPaused)
     {
-        foreach (var slot in _slots.Values)
-            SetTrackEnabled(slot.Track, !isTransmissionPaused);
-
         ApplySenderParametersAll(isTransmissionPaused);
     }
 
     public string BuildTrackMapJson(RTCPeerConnection peer)
     {
-        var orderedSlots = _slots.Values.OrderBy(slot => slot.ClientSlotIndex);
-        var entries = new List<TrackMapEntry>(_slots.Count);
+        IEnumerable<ServerSlot> orderedSlots = _slots.Values.OrderBy(slot => slot.ClientSlotIndex);
+        List<TrackMapEntry> entries = new(_slots.Count);
 
-        foreach (var slot in orderedSlots)
+        foreach (ServerSlot slot in orderedSlots)
         {
             if (peer != null && slot.Transceiver == null)
                 slot.Transceiver = FindTransceiverBySender(peer, slot.Sender);
@@ -162,7 +162,7 @@ internal sealed class WebRtcMediaServerTrackService
 
     public void Shutdown(RTCPeerConnection peer)
     {
-        foreach (var slot in _slots.Values)
+        foreach (ServerSlot slot in _slots.Values)
         {
             try
             {
@@ -174,34 +174,36 @@ internal sealed class WebRtcMediaServerTrackService
                 Debug.LogException(ex);
             }
 
-            DisposeTrackSafe(slot.Track);
+            ReleaseTrack(slot.TrackLease);
             slot.Track = null;
             slot.Sender = null;
             slot.Transceiver = null;
             slot.SourceTexture = null;
+            slot.TrackLease = default;
         }
 
         _slots.Clear();
         _trackMapRevision = 0;
     }
 
-    private bool AddSlot(RTCPeerConnection peer, MediaServerSourceCatalog.ResolvedSource source, bool isTransmissionPaused)
+    private bool AddSlot(RTCPeerConnection peer, SenderSourceCatalog.ResolvedSource source, bool isTransmissionPaused)
     {
         if (peer == null || source.SourceTexture == null)
             return false;
 
-        var track = new VideoStreamTrack(source.SourceTexture);
-        SetTrackEnabled(track, !isTransmissionPaused);
+        SenderSharedTrackRegistry.TrackLease lease = AcquireTrack(source, ignoreSlotIndex: -1);
+        if (!lease.IsValid)
+            return false;
 
         RTCRtpSender sender;
         try
         {
-            sender = peer.AddTrack(track);
+            sender = peer.AddTrack(lease.Track);
         }
         catch (Exception ex)
         {
             Debug.LogException(ex);
-            DisposeTrackSafe(track);
+            ReleaseTrack(lease);
             return false;
         }
 
@@ -215,19 +217,21 @@ internal sealed class WebRtcMediaServerTrackService
             RenderLayer = source.RenderLayer,
             SourceName = source.SourceName,
             SourceTexture = source.SourceTexture,
-            Track = track,
+            Track = lease.Track,
+            TrackLease = lease,
             Sender = sender,
             Transceiver = FindTransceiverBySender(peer, sender)
         };
 
-        Debug.Log($"[MediaServer] Track added for client slot {source.ClientSlotIndex}: {track.Id} ({source.SourceName})");
+        ApplySenderParameters(sender, 0, 0, isTransmissionPaused, applyBitrateOnly: true);
+        Debug.Log($"[Sender] Track added for client slot {source.ClientSlotIndex}: {lease.Track.Id} ({source.SourceName})");
         return true;
     }
 
     private bool ReplaceSlotSource(
         RTCPeerConnection peer,
         ServerSlot slot,
-        MediaServerSourceCatalog.ResolvedSource source,
+        SenderSourceCatalog.ResolvedSource source,
         bool isTransmissionPaused)
     {
         if (slot == null || source.SourceTexture == null)
@@ -254,23 +258,25 @@ internal sealed class WebRtcMediaServerTrackService
             return metadataChanged;
         }
 
-        var newTrack = new VideoStreamTrack(source.SourceTexture);
-        SetTrackEnabled(newTrack, !isTransmissionPaused);
+        SenderSharedTrackRegistry.TrackLease newLease = AcquireTrack(source, slot.ClientSlotIndex);
+        if (!newLease.IsValid)
+            return false;
 
         if (slot.Sender != null)
         {
-            bool replaced = slot.Sender.ReplaceTrack(newTrack);
+            bool replaced = slot.Sender.ReplaceTrack(newLease.Track);
             if (!replaced)
             {
                 Debug.LogError($"ReplaceTrack failed for client slot {slot.ClientSlotIndex}");
-                DisposeTrackSafe(newTrack);
+                ReleaseTrack(newLease);
                 return false;
             }
         }
 
-        var oldTrack = slot.Track;
+        SenderSharedTrackRegistry.TrackLease oldLease = slot.TrackLease;
         slot.SourceTexture = source.SourceTexture;
-        slot.Track = newTrack;
+        slot.Track = newLease.Track;
+        slot.TrackLease = newLease;
         slot.ClientMonitorIndex = source.ClientMonitorIndex;
         slot.ClientPanelIndex = source.ClientPanelIndex;
         slot.ServerDisplayIndex = source.ServerDisplayIndex;
@@ -279,13 +285,14 @@ internal sealed class WebRtcMediaServerTrackService
         slot.SourceName = source.SourceName;
         slot.Transceiver ??= FindTransceiverBySender(peer, slot.Sender);
 
-        DisposeTrackSafe(oldTrack);
+        ApplySenderParameters(slot.Sender, 0, 0, isTransmissionPaused, applyBitrateOnly: true);
+        ReleaseTrack(oldLease);
         return true;
     }
 
     private bool RemoveSlot(RTCPeerConnection peer, int clientSlotIndex)
     {
-        if (!_slots.TryGetValue(clientSlotIndex, out var slot))
+        if (!_slots.TryGetValue(clientSlotIndex, out ServerSlot slot))
             return false;
 
         try
@@ -302,10 +309,10 @@ internal sealed class WebRtcMediaServerTrackService
             Debug.LogException(ex);
         }
 
-        DisposeTrackSafe(slot.Track);
+        ReleaseTrack(slot.TrackLease);
         _slots.Remove(clientSlotIndex);
 
-        Debug.Log($"[MediaServer] Track removed for client slot {clientSlotIndex}");
+        Debug.Log($"[Sender] Track removed for client slot {clientSlotIndex}");
         return true;
     }
 
@@ -319,10 +326,10 @@ internal sealed class WebRtcMediaServerTrackService
             _manager.TotalMaxBitrateMbps,
             _manager.TotalMinBitrateMbps,
             streamCount,
-            out var perStreamMaxBitrate,
-            out var perStreamMinBitrate);
+            out ulong perStreamMaxBitrate,
+            out ulong perStreamMinBitrate);
 
-        foreach (var slot in _slots.Values)
+        foreach (ServerSlot slot in _slots.Values)
             ApplySenderParameters(slot.Sender, perStreamMaxBitrate, perStreamMinBitrate, isTransmissionPaused);
     }
 
@@ -330,27 +337,31 @@ internal sealed class WebRtcMediaServerTrackService
         RTCRtpSender sender,
         ulong perStreamMaxBitrate,
         ulong perStreamMinBitrate,
-        bool isTransmissionPaused)
+        bool isTransmissionPaused,
+        bool applyBitrateOnly = false)
     {
         if (sender == null)
             return;
 
-        var parameters = sender.GetParameters();
+        RTCRtpSendParameters parameters = sender.GetParameters();
         if (parameters.encodings == null)
             return;
 
-        foreach (var encoding in parameters.encodings)
+        foreach (RTCRtpEncodingParameters encoding in parameters.encodings)
         {
             encoding.active = !isTransmissionPaused;
             encoding.scaleResolutionDownBy = 1.0;
             encoding.maxFramerate = _manager.UseMaxFps
                 ? null
                 : (uint)Mathf.Clamp(_manager.MaxFramerate, 1, 90);
-            encoding.maxBitrate = perStreamMaxBitrate;
-            encoding.minBitrate = Math.Min(perStreamMinBitrate, perStreamMaxBitrate);
+
+            if (!applyBitrateOnly || perStreamMaxBitrate > 0)
+                encoding.maxBitrate = perStreamMaxBitrate;
+            if (!applyBitrateOnly || perStreamMaxBitrate > 0)
+                encoding.minBitrate = Math.Min(perStreamMinBitrate, perStreamMaxBitrate);
         }
 
-        var error = sender.SetParameters(parameters);
+        RTCError error = sender.SetParameters(parameters);
         if (error.errorType != RTCErrorType.None)
             Debug.LogError($"SetParameters failed: {error.message}");
     }
@@ -360,7 +371,7 @@ internal sealed class WebRtcMediaServerTrackService
         if (peer == null || sender == null)
             return null;
 
-        foreach (var transceiver in peer.GetTransceivers())
+        foreach (RTCRtpTransceiver transceiver in peer.GetTransceivers())
         {
             if (ReferenceEquals(transceiver.Sender, sender))
                 return transceiver;
@@ -387,41 +398,31 @@ internal sealed class WebRtcMediaServerTrackService
         }
     }
 
-    private static void SetTrackEnabled(MediaStreamTrack track, bool enabled)
+    private SenderSharedTrackRegistry.TrackLease AcquireTrack(SenderSourceCatalog.ResolvedSource source, int ignoreSlotIndex)
     {
-        if (track == null)
-            return;
-
-        try
-        {
-            track.Enabled = enabled;
-        }
-        catch (Exception ex)
-        {
-            Debug.LogException(ex);
-        }
+        bool canUseSharedTrack = CanUseSharedTrackInThisPeer(source, ignoreSlotIndex);
+        return _sharedTrackRegistry.Acquire(source.SourceId, source.SourceTexture, canUseSharedTrack);
     }
 
-    private static void DisposeTrackSafe(MediaStreamTrack track)
+    private bool CanUseSharedTrackInThisPeer(SenderSourceCatalog.ResolvedSource source, int ignoreSlotIndex)
     {
-        if (track == null)
-            return;
+        foreach (ServerSlot slot in _slots.Values)
+        {
+            if (slot.ClientSlotIndex == ignoreSlotIndex)
+                continue;
 
-        try
-        {
-            track.Stop();
-        }
-        catch
-        {
+            if (string.Equals(slot.SourceId, source.SourceId, StringComparison.Ordinal) &&
+                ReferenceEquals(slot.SourceTexture, source.SourceTexture))
+            {
+                return false;
+            }
         }
 
-        try
-        {
-            track.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Debug.LogException(ex);
-        }
+        return true;
+    }
+
+    private void ReleaseTrack(SenderSharedTrackRegistry.TrackLease lease)
+    {
+        _sharedTrackRegistry.Release(lease);
     }
 }

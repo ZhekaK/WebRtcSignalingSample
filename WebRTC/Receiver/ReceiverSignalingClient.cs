@@ -1,9 +1,6 @@
-using FlexNet;
-using FlexNet.Interfaces;
-using FlexNet.Vibe;
-using Microsoft.IO;
+﻿using FlexNet.Server;
+using FlexNet.Server.Controllers;
 using System;
-using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
 using Unity.WebRTC;
@@ -11,77 +8,52 @@ using UnityEngine;
 
 internal sealed class ReceiverSignalingClient : IDisposable
 {
-    private readonly struct SignalingEnvelope
-    {
-        public readonly string Type;
-        public readonly string Payload;
+    private readonly FlexRouteClient _transport = new();
 
-        public SignalingEnvelope(string type, string payload)
-        {
-            Type = type;
-            Payload = payload;
-        }
-    }
-
-    private static readonly RecyclableMemoryStreamManager MemoryStreamManager = new();
-
-    private readonly ConcurrentQueue<SignalingEnvelope> _outgoingMessages = new();
-    private readonly SemaphoreSlim _outgoingSignal = new(0, int.MaxValue);
-
-    private IFlexClient _client;
-    private Task _sendLoopTask;
-    private Task _receiveLoopTask;
+    private string _clientId = string.Empty;
+    private string _senderClientId = string.Empty;
+    private long _lastCatalogRevision = -1;
     private bool _isDisposed;
 
     public event Action<RTCIceCandidateInit> CandidateReceived;
     public event Action<RTCSessionDescription> DescriptionReceived;
     public event Action<string> TrackMapReceived;
-    public event Action<MediaServerHelloMessage> HelloReceived;
+    public event Action<SenderHelloMessage> HelloReceived;
     public event Action<MediaCatalogMessage> CatalogReceived;
     public event Action<MediaSubscriptionAck> SubscribeAckReceived;
     public event Action<Exception> ConnectionLost;
 
-    public bool IsConnected
-    {
-        get
-        {
-            try
-            {
-                return _client != null && _client.Connected;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-    }
+    public bool IsConnected => !_isDisposed && _transport.IsConnected && !string.IsNullOrWhiteSpace(_clientId);
 
-    public async Task ConnectAsync(ReceiverTransportMode mode, string ip, int port, CancellationToken token)
+    public async Task ConnectAsync(string ip, int port, string clientName, CancellationToken token)
     {
         if (_isDisposed)
             return;
 
-        if (mode == ReceiverTransportMode.MediaServer)
-        {
-            _client = new VibeClient(ContentCodecDIProvider.Default, MemoryStreamManager);
-            await _client.ConnectAsync(ip, port);
-            Debug.Log($"[Receiver] Connected to MediaServer {ip}:{port}");
-            return;
-        }
+        await _transport.ConnectAsync(ip, port, token);
+        var (header, response) = await _transport.SendAsync<FlexSignalingRegisterRequest, FlexSignalingRegisterResponse>(
+            FlexNetSignalingRouteIds.RegisterClient,
+            new FlexSignalingRegisterRequest
+            {
+                clientName = clientName ?? Application.productName,
+                role = SignalingClientRole.Receiver,
+            },
+            token);
 
-        using var listener = new VibeListener(System.Net.IPAddress.Any, port, ContentCodecDIProvider.Default, MemoryStreamManager);
-        listener.Start();
-        _client = await listener.AcceptFlexClientAsync();
-        Debug.Log($"[Receiver] Direct peer accepted on port {port}");
+        if (header == null || header.ResponseCode != ResponseCode.Ok || response == null)
+            throw new InvalidOperationException(header?.Message ?? "receiver-register-failed");
+
+        _clientId = response.clientId ?? string.Empty;
+        ProcessServerState(response.senderClientId, response.catalog);
+        Debug.Log($"[Receiver] Connected to signaling server {ip}:{port}");
     }
 
     public void StartLoops(CancellationToken token)
     {
-        if (_isDisposed || _client == null)
+        if (_isDisposed || string.IsNullOrWhiteSpace(_clientId))
             return;
 
-        _sendLoopTask = Task.Run(() => SendSignalingLoopAsync(token), token);
-        _receiveLoopTask = Task.Run(() => ReceiveSignalingLoopAsync(token), token);
+        _ = Task.Run(() => PollLoopAsync(token), token);
     }
 
     public bool SendSubscriptionRequest(MediaSubscriptionRequest request)
@@ -89,18 +61,18 @@ internal sealed class ReceiverSignalingClient : IDisposable
         if (request == null || !IsConnected)
             return false;
 
-        EnqueueSignalingMessage(MediaServerMessageTypes.Subscribe, JsonUtility.ToJson(request));
+        _ = SendToSenderAsync(MediaRelayMessageTypes.Subscribe, JsonUtility.ToJson(request));
         return true;
     }
 
     public void SendDescription(RTCSessionDescription description)
     {
-        EnqueueSignalingMessage(SignalingMessageTypes.Description, JsonUtility.ToJson(description));
+        _ = SendToSenderAsync(SignalingMessageTypes.Description, JsonUtility.ToJson(description));
     }
 
     public void SendCandidate(RTCIceCandidateInit candidate)
     {
-        EnqueueSignalingMessage(SignalingMessageTypes.Candidate, JsonUtility.ToJson(candidate));
+        _ = SendToSenderAsync(SignalingMessageTypes.Candidate, JsonUtility.ToJson(candidate));
     }
 
     public void Dispose()
@@ -109,107 +81,116 @@ internal sealed class ReceiverSignalingClient : IDisposable
             return;
 
         _isDisposed = true;
+        string clientId = _clientId;
+        _clientId = string.Empty;
+        _senderClientId = string.Empty;
+        _ = BestEffortUnregisterAndDisposeAsync(clientId);
+    }
 
-        while (_outgoingMessages.TryDequeue(out _))
-        {
-        }
-
-        _client?.Dispose();
-        _client = null;
-
+    private async Task BestEffortUnregisterAndDisposeAsync(string clientId)
+    {
         try
         {
-            _outgoingSignal.Dispose();
+            if (!string.IsNullOrWhiteSpace(clientId) && _transport.IsConnected)
+            {
+                using CancellationTokenSource timeoutCts = new(500);
+                await _transport.SendAsync(
+                    FlexNetSignalingRouteIds.UnregisterClient,
+                    new FlexSignalingUnregisterRequest { clientId = clientId },
+                    timeoutCts.Token);
+            }
         }
         catch
         {
         }
-    }
-
-    private async Task SendSignalingLoopAsync(CancellationToken token)
-    {
-        while (!token.IsCancellationRequested)
+        finally
         {
-            try
-            {
-                await _outgoingSignal.WaitAsync(token);
-
-                while (_outgoingMessages.TryDequeue(out var envelope))
-                {
-                    var client = _client;
-                    if (client == null)
-                        continue;
-
-                    client.AddContent(envelope.Type).AddContent(envelope.Payload).Send();
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (ObjectDisposedException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogException(ex);
-                break;
-            }
+            _transport.Dispose();
         }
     }
 
-    private async Task ReceiveSignalingLoopAsync(CancellationToken token)
+    private async Task SendToSenderAsync(string type, string payload)
+    {
+        if (!IsConnected || string.IsNullOrWhiteSpace(type))
+            return;
+
+        try
+        {
+            ResponseHeader header = await _transport.SendAsync(
+                FlexNetSignalingRouteIds.SendFromReceiver,
+                new FlexSignalingReceiverMessageRequest
+                {
+                    receiverClientId = _clientId,
+                    type = type,
+                    payload = payload ?? string.Empty,
+                },
+                CancellationToken.None);
+
+            if (!_isDisposed && header?.ResponseCode != ResponseCode.Ok)
+                Debug.LogWarning($"[Receiver] Failed to send '{type}': {header?.Message}");
+        }
+        catch (Exception ex)
+        {
+            if (!_isDisposed)
+                ConnectionLost?.Invoke(ex);
+        }
+    }
+
+    private async Task PollLoopAsync(CancellationToken token)
     {
         Exception disconnectException = null;
 
         try
         {
-            while (!token.IsCancellationRequested)
+            while (!token.IsCancellationRequested && !_isDisposed)
             {
-                var client = _client;
-                if (client == null)
-                    break;
+                var (header, response) = await _transport.PollAsync<FlexSignalingPollRequest, FlexSignalingPollResponse>(
+                    FlexNetSignalingRouteIds.PollMessages,
+                    new FlexSignalingPollRequest
+                    {
+                        clientId = _clientId,
+                    },
+                    token);
 
-                using var results = await client.ReceiveAsync();
                 if (token.IsCancellationRequested || _isDisposed)
                     break;
 
-                results.GetContent(out string type).GetContent(out string json);
+                if (header == null || header.ResponseCode != ResponseCode.Ok)
+                    throw new InvalidOperationException(header?.Message ?? "receiver-poll-failed");
+
                 await Awaitable.MainThreadAsync();
-
                 if (token.IsCancellationRequested || _isDisposed)
                     break;
 
-                switch (type)
+                ProcessServerState(response?.senderClientId, response?.catalog);
+
+                foreach (FlexSignalingEnvelope envelope in response?.messages ?? Array.Empty<FlexSignalingEnvelope>())
                 {
-                    case SignalingMessageTypes.Candidate:
-                        CandidateReceived?.Invoke(JsonUtility.FromJson<RTCIceCandidateInit>(json));
-                        break;
+                    if (envelope == null)
+                        continue;
 
-                    case SignalingMessageTypes.Description:
-                        DescriptionReceived?.Invoke(JsonUtility.FromJson<RTCSessionDescription>(json));
-                        break;
+                    switch (envelope.type)
+                    {
+                        case SignalingMessageTypes.Candidate:
+                            CandidateReceived?.Invoke(JsonUtility.FromJson<RTCIceCandidateInit>(envelope.payload));
+                            break;
 
-                    case SignalingMessageTypes.TrackMap:
-                        TrackMapReceived?.Invoke(json);
-                        break;
+                        case SignalingMessageTypes.Description:
+                            DescriptionReceived?.Invoke(JsonUtility.FromJson<RTCSessionDescription>(envelope.payload));
+                            break;
 
-                    case MediaServerMessageTypes.Hello:
-                        HelloReceived?.Invoke(JsonUtility.FromJson<MediaServerHelloMessage>(json));
-                        break;
+                        case SignalingMessageTypes.TrackMap:
+                            TrackMapReceived?.Invoke(envelope.payload);
+                            break;
 
-                    case MediaServerMessageTypes.Catalog:
-                        CatalogReceived?.Invoke(JsonUtility.FromJson<MediaCatalogMessage>(json));
-                        break;
+                        case MediaRelayMessageTypes.SubscribeAck:
+                            SubscribeAckReceived?.Invoke(JsonUtility.FromJson<MediaSubscriptionAck>(envelope.payload));
+                            break;
 
-                    case MediaServerMessageTypes.SubscribeAck:
-                        SubscribeAckReceived?.Invoke(JsonUtility.FromJson<MediaSubscriptionAck>(json));
-                        break;
-
-                    default:
-                        Debug.LogWarning($"[Receiver] Unknown signaling type '{type}'");
-                        break;
+                        default:
+                            Debug.LogWarning($"[Receiver] Unknown signaling type '{envelope.type}'");
+                            break;
+                    }
                 }
             }
         }
@@ -234,19 +215,27 @@ internal sealed class ReceiverSignalingClient : IDisposable
         }
     }
 
-    private void EnqueueSignalingMessage(string type, string payload)
+    private void ProcessServerState(string senderClientId, MediaCatalogMessage catalog)
     {
-        if (_isDisposed || string.IsNullOrEmpty(type) || string.IsNullOrEmpty(payload))
-            return;
-
-        _outgoingMessages.Enqueue(new SignalingEnvelope(type, payload));
-
-        try
+        if (!string.Equals(_senderClientId, senderClientId ?? string.Empty, StringComparison.Ordinal))
         {
-            _outgoingSignal.Release();
+            _senderClientId = senderClientId ?? string.Empty;
+
+            if (!string.IsNullOrWhiteSpace(_senderClientId))
+            {
+                HelloReceived?.Invoke(new SenderHelloMessage
+                {
+                    sessionId = _senderClientId,
+                    serverName = "FlexNetSignalingServer",
+                    defaultTrackCount = catalog?.sources?.Length ?? 0,
+                });
+            }
         }
-        catch (ObjectDisposedException)
+
+        if (catalog != null && catalog.revision != _lastCatalogRevision)
         {
+            _lastCatalogRevision = catalog.revision;
+            CatalogReceived?.Invoke(catalog);
         }
     }
 }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using Unity.WebRTC;
@@ -27,16 +27,16 @@ internal sealed class SenderStatsReporter
         _outboundStatsSnapshots.Clear();
     }
 
-    public void Log(RTCStatsReport report)
+    public void Log(RTCStatsReport report, string label = null)
     {
         if (report == null)
             return;
 
-        var outboundVideoStats = new List<RTCOutboundRTPStreamStats>();
-        var remoteInboundVideoStats = new List<RTCRemoteInboundRtpStreamStats>();
-        var codecsById = new Dictionary<string, RTCCodecStats>(StringComparer.Ordinal);
+        List<RTCOutboundRTPStreamStats> outboundVideoStats = new();
+        List<RTCRemoteInboundRtpStreamStats> remoteInboundVideoStats = new();
+        Dictionary<string, RTCCodecStats> codecsById = new(StringComparer.Ordinal);
 
-        foreach (var stats in report.Stats.Values)
+        foreach (RTCStats stats in report.Stats.Values)
         {
             switch (stats)
             {
@@ -70,10 +70,10 @@ internal sealed class SenderStatsReporter
         uint totalPliDelta = 0;
         uint totalNackDelta = 0;
 
-        var codecMimeTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var limitationReasons = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> codecMimeTypes = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> limitationReasons = new(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var outbound in outboundVideoStats)
+        foreach (RTCOutboundRTPStreamStats outbound in outboundVideoStats)
         {
             totalTargetBitrateBps += Math.Max(0d, outbound.targetBitrate);
             totalFps += Math.Max(0d, outbound.framesPerSecond);
@@ -85,14 +85,14 @@ internal sealed class SenderStatsReporter
                 limitationReasons.Add(outbound.qualityLimitationReason);
 
             if (!string.IsNullOrEmpty(outbound.codecId) &&
-                codecsById.TryGetValue(outbound.codecId, out var codecStats) &&
+                codecsById.TryGetValue(outbound.codecId, out RTCCodecStats codecStats) &&
                 !string.IsNullOrWhiteSpace(codecStats.mimeType))
             {
                 codecMimeTypes.Add(codecStats.mimeType);
             }
 
             string statKey = string.IsNullOrEmpty(outbound.Id) ? outbound.ssrc.ToString() : outbound.Id;
-            if (_outboundStatsSnapshots.TryGetValue(statKey, out var previous))
+            if (_outboundStatsSnapshots.TryGetValue(statKey, out OutboundStatsSnapshot previous))
             {
                 long durationUs = outbound.Timestamp - previous.TimestampUs;
                 if (durationUs > 0 && outbound.bytesSent >= previous.BytesSent)
@@ -152,7 +152,7 @@ internal sealed class SenderStatsReporter
         double averageLossPercent = double.NaN;
         if (remoteInboundVideoStats.Count > 0)
         {
-            var rttSamples = remoteInboundVideoStats
+            double[] rttSamples = remoteInboundVideoStats
                 .Select(stat => stat.roundTripTime)
                 .Where(value => value > 0d)
                 .Select(value => value * 1000d)
@@ -161,7 +161,7 @@ internal sealed class SenderStatsReporter
             if (rttSamples.Length > 0)
                 averageRttMs = rttSamples.Average();
 
-            var lossSamples = remoteInboundVideoStats
+            double[] lossSamples = remoteInboundVideoStats
                 .Select(stat => stat.fractionLost)
                 .Where(value => value >= 0d)
                 .Select(value => value * 100d)
@@ -195,9 +195,12 @@ internal sealed class SenderStatsReporter
         string sendDelayText = totalPacketsSentDelta > 0
             ? $"{(totalPacketSendDelayDeltaMs / totalPacketsSentDelta):F2} ms"
             : "n/a";
+        string prefix = string.IsNullOrWhiteSpace(label)
+            ? "[WebRTC Sender Stats]"
+            : $"[WebRTC Sender Stats {label}]";
 
         Debug.Log(
-            $"[WebRTC Sender Stats] tx={(totalBitrateBps / 1_000_000d):F1} Mbps " +
+            $"{prefix} tx={(totalBitrateBps / 1_000_000d):F1} Mbps " +
             $"target={(totalTargetBitrateBps / 1_000_000d):F1} Mbps streams={outboundVideoStats.Count} " +
             $"codec={codecText} res={resolutionText} fps={totalFps:F1} avgQp={avgQpText} " +
             $"rtt={rttText} loss={lossText} enc={encodeText} send={sendDelayText} " +

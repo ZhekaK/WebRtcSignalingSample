@@ -4,7 +4,7 @@ using System.Linq;
 using System.Threading;
 using UnityEngine;
 
-internal sealed class MediaServerSourceCatalog
+internal sealed class SenderSourceCatalog
 {
     internal readonly struct ResolvedSource
     {
@@ -49,12 +49,29 @@ internal sealed class MediaServerSourceCatalog
 
     public MediaCatalogMessage BuildCatalogMessage()
     {
-        var snapshot = BuildSnapshot();
+        List<CatalogEntry> snapshot = BuildSnapshot();
         return new MediaCatalogMessage
         {
             revision = Interlocked.Increment(ref _catalogRevision),
             sources = snapshot.Select(static entry => entry.Descriptor).ToArray()
         };
+    }
+
+    public SenderAvailableRenderTextureInfo[] BuildAvailableRenderTextureSnapshot()
+    {
+        return BuildSnapshot()
+            .Select(entry => new SenderAvailableRenderTextureInfo
+            {
+                SourceId = entry.Descriptor.sourceId,
+                SourceName = entry.Descriptor.sourceName,
+                ServerDisplayIndex = entry.Descriptor.serverDisplayIndex,
+                RenderLayer = entry.RenderLayer.ToString(),
+                Width = entry.Descriptor.width,
+                Height = entry.Descriptor.height,
+                IsDefaultLayer = entry.Descriptor.isDefaultLayer,
+                Texture = entry.Texture,
+            })
+            .ToArray();
     }
 
     public MediaSubscriptionRequest BuildDefaultRequest()
@@ -114,9 +131,9 @@ internal sealed class MediaServerSourceCatalog
             if (subscription == null || string.IsNullOrWhiteSpace(subscription.sourceId))
                 continue;
 
-            if (!entryById.TryGetValue(subscription.sourceId, out var entry) || entry.Texture == null)
+            if (!entryById.TryGetValue(subscription.sourceId, out CatalogEntry entry) || entry.Texture == null)
             {
-                Debug.LogWarning($"[MediaServer] Requested source '{subscription.sourceId}' is not available.");
+                Debug.LogWarning($"[SenderCatalog] Requested source '{subscription.sourceId}' is not available.");
                 continue;
             }
 
@@ -161,7 +178,7 @@ internal sealed class MediaServerSourceCatalog
 
             foreach (RenderLayer renderLayer in Enum.GetValues(typeof(RenderLayer)))
             {
-                if (!renderingLayers.TryGetValue(renderLayer, out var layerData))
+                if (!renderingLayers.TryGetValue(renderLayer, out RenderLayerData layerData))
                     continue;
 
                 if (layerData?.Settings == null || !layerData.Settings.ExistOnDisplay || layerData.RT == null)

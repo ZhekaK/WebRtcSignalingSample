@@ -1,4 +1,4 @@
-using System.Threading.Tasks;
+﻿using System.Threading.Tasks;
 using UnityEngine;
 
 public partial class SenderManager
@@ -6,95 +6,35 @@ public partial class SenderManager
     [ContextMenu("Pause Transmission")]
     public void PauseTransmission()
     {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-        {
-            if (!(_mediaServer?.PauseAllSessions() ?? false))
-                Debug.LogWarning("[MediaServer] Pause requested, but there are no active client sessions.");
-
-            return;
-        }
-
-        _session?.PauseTransmission();
+        if (!(_relayHub?.PauseAllSessions() ?? false))
+            Debug.LogWarning("[Sender] Pause requested, but there are no active receiver sessions.");
     }
 
     [ContextMenu("Resume Transmission")]
     public void ResumeTransmission()
     {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-        {
-            if (!(_mediaServer?.ResumeAllSessions() ?? false))
-                Debug.LogWarning("[MediaServer] Resume requested, but there are no active client sessions.");
-
-            return;
-        }
-
-        _session?.ResumeTransmission();
+        if (!(_relayHub?.ResumeAllSessions() ?? false))
+            Debug.LogWarning("[Sender] Resume requested, but there are no active receiver sessions.");
     }
 
     [ContextMenu("Apply Encoder Settings Now")]
     public bool ApplyEncoderSettingsNow()
     {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-            return _mediaServer != null && _mediaServer.ApplyEncoderSettingsNow();
+        bool applied = _relayHub != null && _relayHub.ApplyEncoderSettingsNow();
+        if (!applied)
+            Debug.LogWarning("[Sender] ApplyEncoderSettingsNow requested, but there are no active receiver sessions.");
 
-        return _session != null && _session.ApplyEncoderSettingsNow();
+        return applied;
     }
 
     [ContextMenu("Sync Tracks With Sources")]
     public bool SyncTracksWithSources()
     {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-            return _mediaServer != null && _mediaServer.RefreshAllClientSubscriptions();
+        bool synced = _relayHub != null && _relayHub.RefreshAllClientSubscriptions();
+        if (!synced)
+            Debug.LogWarning("[Sender] SyncTracksWithSources requested, but there are no active receiver sessions.");
 
-        return _session != null && _session.SyncTracksWithSources();
-    }
-
-    [ContextMenu("Test Add Track")]
-    public void TestAddTrack()
-    {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-        {
-            if (!(_mediaServer?.DebugAddTrackToFirstClient() ?? false))
-                Debug.LogWarning("[MediaServer] Test Add Track failed: no connected client or no additional source is available.");
-
-            return;
-        }
-
-        if (SourceRenderTextures == null || SourceRenderTextures.Count == 0)
-        {
-            Debug.LogError("No source textures configured.");
-            return;
-        }
-
-        if (!AddSourceTrack(SourceRenderTextures[SourceRenderTextures.Count - 1]))
-            Debug.LogError("Add track failed");
-
-        if (!SyncTracksWithSources())
-            Debug.LogError("Sync track failed");
-    }
-
-    [ContextMenu("Test Remove Track")]
-    public void TestRemoveTrack()
-    {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-        {
-            if (!(_mediaServer?.DebugRemoveTrackFromFirstClient() ?? false))
-                Debug.LogWarning("[MediaServer] Test Remove Track failed: no connected client or there is nothing to remove.");
-
-            return;
-        }
-
-        if (SourceRenderTextures == null || SourceRenderTextures.Count == 0)
-        {
-            Debug.LogError("No source textures configured.");
-            return;
-        }
-
-        if (!RemoveSourceTrack(SourceRenderTextures.Count - 1))
-            Debug.LogError("Remove track failed");
-
-        if (!SyncTracksWithSources())
-            Debug.LogError("Sync track failed");
+        return synced;
     }
 
     [ContextMenu("Restart Transmission Clean")]
@@ -111,17 +51,8 @@ public partial class SenderManager
         _isRestartingTransmission = true;
         try
         {
-            if (RuntimeMode == SenderTransportMode.MediaServer)
-            {
-                _mediaServer ??= new WebRtcMediaServer(this);
-                await _mediaServer.RestartAsync();
-                return;
-            }
-
-            if (_session == null)
-                _session = new SenderSession(this);
-
-            await _session.RestartAsync();
+            _relayHub ??= new SenderRelayHub(this);
+            await _relayHub.RestartAsync();
         }
         finally
         {
@@ -141,9 +72,10 @@ public partial class SenderManager
 
     public async Task ChangeDestinationEndpointAsync(string newIp, int newPort)
     {
-        if (_session == null)
-            return;
+        IP = newIp;
+        Port = newPort;
 
-        await _session.ChangeDestinationEndpointAsync(newIp, newPort);
+        if (_relayHub != null)
+            await _relayHub.RestartAsync();
     }
 }

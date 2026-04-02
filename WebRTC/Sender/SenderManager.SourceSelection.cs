@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using TabletTypes;
 using UnityEngine;
@@ -38,7 +39,10 @@ public partial class SenderManager
 
         var displays = DisplaysManager.Instance?.DisplaysDatas;
         if (displays == null)
+        {
+            _relayHub?.RefreshAllClientSubscriptions();
             return;
+        }
 
         foreach (DisplayData displayData in displays.Values)
         {
@@ -49,23 +53,51 @@ public partial class SenderManager
             }
         }
 
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-        {
-            _mediaServer?.RefreshAllClientSubscriptions();
-            return;
-        }
-
-        _session?.SyncTracksWithSources();
+        _relayHub?.RefreshAllClientSubscriptions();
     }
 
     public bool ChangeSourceResolution(int displayIndex, int width, int height)
     {
-        return _session != null && _session.ChangeSourceResolution(displayIndex, width, height);
+        if (displayIndex < 0 || SourceRenderTextures == null || displayIndex >= SourceRenderTextures.Count)
+        {
+            Debug.LogError($"Invalid display index: {displayIndex}");
+            return false;
+        }
+
+        RenderTexture sourceTexture = SourceRenderTextures[displayIndex];
+        if (sourceTexture == null)
+        {
+            Debug.LogError($"No source texture configured for display index {displayIndex}.");
+            return false;
+        }
+
+        if (sourceTexture.width == width && sourceTexture.height == height)
+            return true;
+
+        try
+        {
+            sourceTexture.Release();
+            sourceTexture.width = width;
+            sourceTexture.height = height;
+            sourceTexture.Create();
+            return RefreshSourceTrack(displayIndex);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogException(ex);
+            return false;
+        }
     }
 
     public bool RefreshSourceTrack(int displayIndex)
     {
-        return _session != null && _session.RefreshSourceTrack(displayIndex);
+        if (displayIndex < 0 || SourceRenderTextures == null || displayIndex >= SourceRenderTextures.Count)
+        {
+            Debug.LogError($"Invalid display index: {displayIndex}");
+            return false;
+        }
+
+        return _relayHub == null || _relayHub.RefreshAllClientSubscriptions();
     }
 
     public bool AddSourceTrack(RenderTexture sourceTexture, int displayIndex = -1)
@@ -79,11 +111,7 @@ public partial class SenderManager
         int targetIndex = ResolveTargetDisplayIndex(displayIndex);
         EnsureSourceCapacity(targetIndex + 1);
         SourceRenderTextures[targetIndex] = sourceTexture;
-
-        if (_session == null)
-            return true;
-
-        return _session.AddOrReplaceSourceTrack(targetIndex, sourceTexture);
+        return _relayHub == null || _relayHub.RefreshAllClientSubscriptions();
     }
 
     public bool RemoveSourceTrack(int displayIndex, bool clearSourceSlot = true)
@@ -94,15 +122,11 @@ public partial class SenderManager
             return false;
         }
 
-        bool removed = _session == null || _session.RemoveSourceTrack(displayIndex);
-        if (!removed)
-            return false;
-
         if (clearSourceSlot)
             SourceRenderTextures[displayIndex] = null;
 
         TrimTrailingEmptySourceSlots();
-        return true;
+        return _relayHub == null || _relayHub.RefreshAllClientSubscriptions();
     }
 
     private int ResolveTargetDisplayIndex(int preferredIndex)

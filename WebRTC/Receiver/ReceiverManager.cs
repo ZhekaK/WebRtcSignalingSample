@@ -5,17 +5,8 @@ using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.UI;
 
-public enum ReceiverTransportMode
-{
-    DirectPeer = 0,
-    MediaServer = 1
-}
-
 public class ReceiverManager : MonoBehaviour
 {
-    [Header("Mode")]
-    public ReceiverTransportMode RuntimeMode = ReceiverTransportMode.MediaServer;
-
     [Header("Connection")]
     public string IP = "127.0.0.1";
     public int Port = 8005;

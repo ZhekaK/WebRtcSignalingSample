@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-internal sealed class MediaServerActivationTable
+internal sealed class SenderSourceActivationTable
 {
     internal enum ActivationChangeType
     {
@@ -50,15 +50,15 @@ internal sealed class MediaServerActivationTable
     private readonly Dictionary<string, SourceState> _sourceStates = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<string>> _sessionSources = new(StringComparer.Ordinal);
 
-    public ActivationChange[] ApplySessionSelection(string sessionId, IReadOnlyList<MediaServerSourceCatalog.ResolvedSource> selectedSources)
+    public ActivationChange[] ApplySessionSelection(string sessionId, IReadOnlyList<SenderSourceCatalog.ResolvedSource> selectedSources)
     {
         if (string.IsNullOrWhiteSpace(sessionId))
             return Array.Empty<ActivationChange>();
 
         var nextSourceIds = new HashSet<string>(StringComparer.Ordinal);
-        var sourceById = new Dictionary<string, MediaServerSourceCatalog.ResolvedSource>(StringComparer.Ordinal);
+        var sourceById = new Dictionary<string, SenderSourceCatalog.ResolvedSource>(StringComparer.Ordinal);
 
-        foreach (var source in selectedSources ?? Array.Empty<MediaServerSourceCatalog.ResolvedSource>())
+        foreach (var source in selectedSources ?? Array.Empty<SenderSourceCatalog.ResolvedSource>())
         {
             if (string.IsNullOrWhiteSpace(source.SourceId))
                 continue;
@@ -132,7 +132,7 @@ internal sealed class MediaServerActivationTable
         if (string.IsNullOrWhiteSpace(sessionId) || !_sessionSources.TryGetValue(sessionId, out _))
             return Array.Empty<ActivationChange>();
 
-        var transitions = ApplySessionSelection(sessionId, Array.Empty<MediaServerSourceCatalog.ResolvedSource>());
+        var transitions = ApplySessionSelection(sessionId, Array.Empty<SenderSourceCatalog.ResolvedSource>());
         _sessionSources.Remove(sessionId);
         return transitions;
     }

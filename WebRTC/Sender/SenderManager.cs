@@ -1,9 +1,22 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Net;
 using System.Threading;
-using System.Threading.Tasks;
 using TabletTypes;
 using UnityEngine;
+
+[Serializable]
+public struct SenderAvailableRenderTextureInfo
+{
+    public string SourceId;
+    public string SourceName;
+    public int ServerDisplayIndex;
+    public string RenderLayer;
+    public int Width;
+    public int Height;
+    public bool IsDefaultLayer;
+    public RenderTexture Texture;
+}
 
 public enum SenderVideoCodecPreference
 {
@@ -14,38 +27,25 @@ public enum SenderVideoCodecPreference
     AV1 = 4
 }
 
-public enum SenderTransportMode
-{
-    DirectPeer = 0,
-    MediaServer = 1
-}
-
-/// <summary>
-/// Unity-facing manager for the sender module.
-/// Attach this component to the sender GameObject.
-/// </summary>
 [DefaultExecutionOrder(-20)]
 public partial class SenderManager : MonoBehaviour
 {
     public static SenderManager Instance { get; private set; }
 
-    [Header("Runtime")]
-    [Tooltip("DirectPeer preserves the old one-to-one sender->receiver flow. MediaServer starts a FlexNet signaling server and creates one WebRTC peer per connected client.")]
-    public SenderTransportMode RuntimeMode = SenderTransportMode.MediaServer;
-
     [Header("Signaling")]
-    [Tooltip("Receiver signaling host IP address for DirectPeer mode.")]
+    [Tooltip("FlexNet signaling server IP.")]
     public string IP = "10.24.50.23";
 
-    [Tooltip("Receiver signaling host port for DirectPeer mode, or local listen port for MediaServer mode.")]
+    [Tooltip("FlexNet signaling server port.")]
     public int Port = 8005;
 
     [Header("Video Sources")]
-    [Tooltip("RenderTextures in source order used by sender tracks.")]
+    [HideInInspector]
+    [Tooltip("Legacy cache of the current layer RenderTextures. Sending now uses the full source catalog from DisplaysManager.")]
     public List<RenderTexture> SourceRenderTextures = new();
 
     [Header("Connection")]
-    [Tooltip("Continuously tries to connect/reconnect signaling and peer when disconnected.")]
+    [Tooltip("Continuously tries to connect/reconnect to the signaling server when disconnected.")]
     public bool WaitForClientConnection = true;
 
     [Tooltip("Reconnect retry interval in milliseconds.")]
@@ -81,10 +81,11 @@ public partial class SenderManager : MonoBehaviour
     public int SenderStatsLogIntervalSec = 10;
 
     [Header("Inspector")]
-    [SerializeField] private string[] ActiveMediaServerSources = Array.Empty<string>();
+    [SerializeField] private SenderAvailableRenderTextureInfo[] AvailableRenderTextureCatalog = Array.Empty<SenderAvailableRenderTextureInfo>();
+    [SerializeField] private string[] ActiveRequestedSources = Array.Empty<string>();
 
-    private SenderSession _session;
-    private WebRtcMediaServer _mediaServer;
+    private FlexNetSignalingServer _signalingServer;
+    private SenderRelayHub _relayHub;
     private bool _isRestartingTransmission;
     private Coroutine _webRtcUpdateCoroutine;
     private CancellationTokenSource _connectionLoopCts;
@@ -134,21 +135,16 @@ public partial class SenderManager : MonoBehaviour
 
     protected virtual void Start()
     {
-        if (RuntimeMode == SenderTransportMode.MediaServer)
-        {
-            _mediaServer = new WebRtcMediaServer(this);
-            SetMediaServerActivationSnapshot(Array.Empty<string>());
-            _ = _mediaServer.StartAsync();
-            return;
-        }
+        EnsureSignalingServerStarted();
 
-        _session = new SenderSession(this);
+        _relayHub = new SenderRelayHub(this);
         SetRenderTextures(RenderLayer.Visible);
+        _relayHub.RefreshInspectorState();
 
         if (WaitForClientConnection)
             StartConnectionLoop();
         else
-            _ = _session.InitializeAsync(forceReconnect: false);
+            _ = _relayHub.StartAsync();
     }
 
     protected virtual void OnDestroy()
@@ -156,16 +152,61 @@ public partial class SenderManager : MonoBehaviour
         Unsubscribe();
 
         StopConnectionLoop();
-        _mediaServer?.Dispose();
-        _mediaServer = null;
-        SetMediaServerActivationSnapshot(Array.Empty<string>());
-        _session?.Dispose();
-        _session = null;
+        _relayHub?.Dispose();
+        _relayHub = null;
+        DisposeSignalingServer();
+        SetAvailableRenderTextureCatalogSnapshot(Array.Empty<SenderAvailableRenderTextureInfo>());
+        SetActiveSourceSnapshot(Array.Empty<string>());
         StopWebRtcUpdateLoop();
+
+        if (Instance == this)
+            Instance = null;
     }
 
-    internal void SetMediaServerActivationSnapshot(string[] snapshot)
+    private void OnApplicationQuit()
     {
-        ActiveMediaServerSources = snapshot ?? Array.Empty<string>();
+        DisposeSignalingServer();
+    }
+
+    internal void SetAvailableRenderTextureCatalogSnapshot(SenderAvailableRenderTextureInfo[] snapshot)
+    {
+        AvailableRenderTextureCatalog = snapshot ?? Array.Empty<SenderAvailableRenderTextureInfo>();
+    }
+
+    internal void SetActiveSourceSnapshot(string[] snapshot)
+    {
+        ActiveRequestedSources = snapshot ?? Array.Empty<string>();
+    }
+
+    private void EnsureSignalingServerStarted()
+    {
+        if (_signalingServer?.IsStarted == true)
+            return;
+
+        _signalingServer ??= new FlexNetSignalingServer(new FlexNetSignalingServerOptions
+        {
+            EndPoint = new IPEndPoint(IPAddress.Any, Port),
+        });
+
+        _signalingServer.Start();
+    }
+
+    private void DisposeSignalingServer()
+    {
+        if (_signalingServer == null)
+            return;
+
+        try
+        {
+            _signalingServer.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Sender] Failed to stop signaling server cleanly: {ex.Message}");
+        }
+        finally
+        {
+            _signalingServer = null;
+        }
     }
 }

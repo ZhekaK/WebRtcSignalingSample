@@ -29,11 +29,10 @@ public partial class SenderManager
         {
             try
             {
-                if (_session == null)
-                    _session = new SenderSession(this);
+                _relayHub ??= new SenderRelayHub(this);
 
-                if (!_session.IsConnectionReady)
-                    await _session.InitializeAsync(forceReconnect: false);
+                if (!_relayHub.IsConnectionReady)
+                    await _relayHub.StartAsync();
 
                 await Task.Delay(Mathf.Max(100, ReconnectDelayMs), token);
             }
