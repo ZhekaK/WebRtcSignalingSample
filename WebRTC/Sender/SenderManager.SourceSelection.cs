@@ -5,31 +5,6 @@ using UnityEngine;
 
 public partial class SenderManager
 {
-    private void LayerDataReceiverModeController_OnStateChanged(object sender, EvsStateChangedEventArgs e)
-    {
-        if (e.CurrentStateEvs)
-            SetRenderTextures(RenderLayer.EVS);
-        else
-            SetRenderTextures(CastToNewEnum(e.CurrentLayer));
-    }
-
-    private RenderLayer CastToNewEnum(ImitatorVisibleLayer layer)
-    {
-        switch (layer)
-        {
-            case ImitatorVisibleLayer.Visible:
-                return RenderLayer.Visible;
-            case ImitatorVisibleLayer.LWIR:
-                return RenderLayer.LWIR;
-            case ImitatorVisibleLayer.SWIR:
-                return RenderLayer.SWIR;
-            case ImitatorVisibleLayer.Labels:
-                return RenderLayer.Labels;
-            default:
-                return RenderLayer.Visible;
-        }
-    }
-
     public void SetRenderTextures(RenderLayer layer)
     {
         if (SourceRenderTextures == null)

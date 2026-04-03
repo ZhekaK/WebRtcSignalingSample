@@ -42,6 +42,19 @@ public sealed class ReceiverSubscriptionManager
         return Clone(CurrentRequest);
     }
 
+    public MediaSubscriptionRequest UseCustomRequest(List<MediaSubscriptionEntry> neededSubscriptions)
+    {
+        ActiveScenario = ReceiverSubscriptionScenario.Custom;
+        CurrentRequest = new MediaSubscriptionRequest
+        {
+            clientName = _manager.ClientName,
+            useDefaultLayout = false,
+            allowEmptySelection= neededSubscriptions.Count == 0,
+            subscriptions = neededSubscriptions.ToArray()
+        };
+        return Clone(CurrentRequest);
+    }
+
     public MediaSubscriptionRequest UseOneSourcePerMonitor()
     {
         var catalogSources = GetCatalogSourcesOrdered();

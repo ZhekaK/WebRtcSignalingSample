@@ -58,11 +58,11 @@ public partial class SenderManager : MonoBehaviour
 
     [Header("Bandwidth Budget")]
     [Tooltip("Total max bitrate budget for all video streams in Mbps.")]
-    [Range(30, 1000)]
+    [Range(0, 1000)]
     public int TotalMaxBitrateMbps = 280;
 
     [Tooltip("Total min bitrate budget for all video streams in Mbps.")]
-    [Range(10, 1000)]
+    [Range(0, 1000)]
     public int TotalMinBitrateMbps = 120;
 
     [Tooltip("If enabled, sender does not set a framerate cap in RTP encoding parameters.")]
@@ -100,7 +100,6 @@ public partial class SenderManager : MonoBehaviour
         DontDestroyOnLoad(sender);
 
         Instance.LoadSettings(SaveManager.Instance.Settings.WebRtcSender);
-        Instance.Subscribe();
     }
 
     private void LoadSettings(WebRtcSettings settings)
@@ -115,22 +114,6 @@ public partial class SenderManager : MonoBehaviour
         Port = settings.Port;
         TotalMaxBitrateMbps = settings.TotalMaxBitrateMbps;
         TotalMinBitrateMbps = settings.TotalMinBitrateMbps;
-    }
-
-    private void Subscribe()
-    {
-        if (LayerDataReceiverModeController.Instance == null)
-            return;
-
-        LayerDataReceiverModeController.Instance.OnEvsStateChanged += LayerDataReceiverModeController_OnStateChanged;
-    }
-
-    private void Unsubscribe()
-    {
-        if (LayerDataReceiverModeController.Instance == null)
-            return;
-
-        LayerDataReceiverModeController.Instance.OnEvsStateChanged -= LayerDataReceiverModeController_OnStateChanged;
     }
 
     protected virtual void Start()
@@ -149,8 +132,6 @@ public partial class SenderManager : MonoBehaviour
 
     protected virtual void OnDestroy()
     {
-        Unsubscribe();
-
         StopConnectionLoop();
         _relayHub?.Dispose();
         _relayHub = null;

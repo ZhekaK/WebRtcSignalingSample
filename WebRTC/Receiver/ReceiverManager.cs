@@ -1,4 +1,6 @@
+//using NUnit.Framework;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -102,6 +104,27 @@ public class ReceiverManager : MonoBehaviour
     public void RequestThreeSourcesToCenter()
     {
         SendSubscription(_subscriptionManager.UseThreeSourcesToCenterMonitor());
+    }
+
+    [ContextMenu("Custom Request")]
+    public void CustomRequest()
+    {
+        List<MediaSubscriptionEntry> subscriptions = new();
+        subscriptions.Add(SubscriptionEntryBuilder(0, RenderLayer.Visible, subscriptions.Count));
+        subscriptions.Add(SubscriptionEntryBuilder(0, RenderLayer.EVS, subscriptions.Count));
+
+        SendSubscription(_subscriptionManager.UseCustomRequest(subscriptions));
+    }
+
+    private MediaSubscriptionEntry SubscriptionEntryBuilder(int displayIndex, RenderLayer layer, int slotIndex)
+    {
+        var sub = new MediaSubscriptionEntry();
+        sub.sourceId = $"display-{displayIndex + 1}-{layer.ToString().ToLowerInvariant()}";
+        sub.clientMonitorIndex = displayIndex;
+        sub.clientSlotIndex = slotIndex;
+        sub.clientPanelIndex = 0;
+        sub.note = "custom";
+        return sub;
     }
 
     internal void OnCatalogReceived(MediaCatalogMessage catalog)

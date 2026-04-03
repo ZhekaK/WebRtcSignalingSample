@@ -84,7 +84,7 @@ internal sealed class SenderSourceCatalog
         {
             int panelIndex = 0;
 
-            foreach (var entry in group.Take(2))
+            foreach (var entry in group.Take(1))
             {
                 requestEntries.Add(new MediaSubscriptionEntry
                 {
